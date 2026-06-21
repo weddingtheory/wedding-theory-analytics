@@ -245,7 +245,7 @@ export async function getSearchConsoleData(): Promise<SCData | null> {
   const sitemapUrls  = firstSitemap ? await fetchSitemapUrls(firstSitemap) : []
 
   const pageInspections: PageInspection[] = []
-  for (const url of sitemapUrls) {
+  for (const url of sitemapUrls.slice(0, 10)) {
     const j = await inspectUrl(token, url, siteUrl)
     if (j) pageInspections.push(parseInspection(url, j))
     await new Promise(r => setTimeout(r, 150))

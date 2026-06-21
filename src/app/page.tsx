@@ -166,6 +166,8 @@ function VitalCard({ name, metric, p50, p75, p90, isCls = false }: {
   )
 }
 
+export const dynamic = "force-dynamic"
+
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default async function Home() {
