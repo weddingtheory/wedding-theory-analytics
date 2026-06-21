@@ -1,5 +1,6 @@
 import { getCloudflareData } from "@/lib/cloudflare"
 import { getSearchConsoleData } from "@/lib/search-console"
+import { getBingData } from "@/lib/bing"
 import type {
   DayGroup, CountryEntry, StatusEntry, ContentEntry,
   BrowserEntry, SSLEntry, HTTPVerEntry, IPClassEntry,
@@ -33,12 +34,12 @@ function flag(code: string) {
 
 // ─── HTTP map aggregation ─────────────────────────────────────────────────────
 
-function aggMap<T extends Record<string, string | number>>(
+function aggMap<T>(
   days: DayGroup[], field: keyof DayGroup["sum"], keyField: keyof T, valueField: keyof T,
 ): { key: string; value: number }[] {
   const m = new Map<string, number>()
   for (const day of days)
-    for (const e of (day.sum[field] as T[]))
+    for (const e of (day.sum[field] as unknown as T[]))
       m.set(String(e[keyField]), (m.get(String(e[keyField])) ?? 0) + Number(e[valueField]))
   return [...m.entries()].map(([key, value]) => ({ key, value })).sort((a, b) => b.value - a.value)
 }
@@ -168,7 +169,7 @@ function VitalCard({ name, metric, p50, p75, p90, isCls = false }: {
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default async function Home() {
-  const [data, sc] = await Promise.all([getCloudflareData(), getSearchConsoleData()])
+  const [data, sc, bing] = await Promise.all([getCloudflareData(), getSearchConsoleData(), getBingData()])
   if (!data) return (
     <div className="min-h-screen flex items-center justify-center bg-gray-50">
       <p className="text-red-500">Failed to fetch. Check API credentials in .env</p>
@@ -925,9 +926,194 @@ export default async function Home() {
           })()}
         </div>
 
+        {/* ══════════════════════════════════════════════════════════════════ */}
+        {/* ── Bing Webmaster Tools ────────────────────────────────────────── */}
+        {/* ══════════════════════════════════════════════════════════════════ */}
+
+        <div className="border-t-2 border-gray-300 pt-8">
+          <div className="flex items-center gap-3 mb-6">
+            <div className="w-6 h-6 rounded-full bg-[#008373] flex items-center justify-center">
+              <span className="text-white text-xs font-bold">B</span>
+            </div>
+            <h2 className="text-lg font-bold text-gray-900">Bing Webmaster Tools</h2>
+            {bing && (
+              <span className="text-xs text-gray-600 bg-gray-100 px-2 py-0.5 rounded">
+                {bing.startDate} → {bing.endDate} · 90 days
+              </span>
+            )}
+          </div>
+
+          {!bing && (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+              Bing API key not set. Add <code className="bg-red-100 px-1 rounded">Bing_api</code> to .env
+            </div>
+          )}
+
+          {bing && (() => {
+            const totalClicks      = bing.queryStats.reduce((a, r) => a + r.clicks, 0)
+            const totalImpressions = bing.queryStats.reduce((a, r) => a + r.impressions, 0)
+            const avgPos           = bing.queryStats.length > 0
+              ? bing.queryStats.reduce((a, r) => a + r.avgPosition, 0) / bing.queryStats.length
+              : 0
+
+            const crawledPages = bing.pageInfo.filter(p => p.lastCrawled).length
+            const largeSizeThreshold = 500 * 1024 // 500 KB
+
+            const sizeColor = (bytes: number) =>
+              bytes >= 1_000_000 ? "text-red-700 font-semibold" :
+              bytes >= largeSizeThreshold ? "text-amber-700 font-semibold" : "text-gray-800"
+
+            return (
+              <div className="space-y-6">
+
+                {/* ── Overview stats ── */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                  <StatCard label="Bing Clicks (90d)"      value={fmtNum(totalClicks)}
+                    sub={totalClicks === 0 ? "No Bing traffic yet" : undefined} />
+                  <StatCard label="Bing Impressions (90d)" value={fmtNum(totalImpressions)}
+                    sub={totalImpressions === 0 ? "No impressions yet" : undefined} />
+                  <StatCard label="Avg Position (Bing)"    value={avgPos > 0 ? avgPos.toFixed(1) : "—"}
+                    sub="When Bing shows your site" />
+                  <StatCard label="Pages Crawled by Bing"  value={`${crawledPages} / ${bing.pageInfo.length}`}
+                    sub="From sitemap" color={crawledPages === bing.pageInfo.length ? "text-green-700" : "text-amber-700"} />
+                </div>
+
+                {/* ── Crawl status per page ── */}
+                {bing.pageInfo.length > 0 && (
+                  <Section title="Bing Crawl Status" sub="Per-page — discovery date, last crawl, document size, inbound anchor links">
+                    <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
+                      Pages highlighted in red are very large (&gt;1 MB) and may be slow to crawl. Amber pages are &gt;500 KB.
+                    </div>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
+                          <th className="text-left pb-2">Page</th>
+                          <th className="text-right pb-2">Discovered</th>
+                          <th className="text-right pb-2">Last Crawled</th>
+                          <th className="text-right pb-2">Doc Size</th>
+                          <th className="text-right pb-2">Inbound Links</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {bing.pageInfo.map((p, i) => (
+                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                            <td className="py-2 font-mono text-xs text-gray-900 max-w-[240px] truncate" title={p.url}>{p.path}</td>
+                            <td className="py-2 text-right text-gray-700">{p.discoveryDate || <span className="text-gray-400">—</span>}</td>
+                            <td className="py-2 text-right">
+                              {p.lastCrawled
+                                ? <span className="text-gray-800">{p.lastCrawled}</span>
+                                : <span className="text-amber-600 font-medium">Not yet</span>}
+                            </td>
+                            <td className={`py-2 text-right ${sizeColor(p.documentSizeBytes)}`}>
+                              {p.documentSizeBytes > 0 ? fmtBytes(p.documentSizeBytes) : <span className="text-gray-400">—</span>}
+                            </td>
+                            <td className="py-2 text-right">
+                              {p.anchorCount > 0
+                                ? <span className="text-blue-700 font-semibold">{p.anchorCount}</span>
+                                : <span className="text-gray-400">0</span>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Section>
+                )}
+
+                {/* ── Traffic / Queries (when data exists) ── */}
+                {bing.queryStats.length > 0 ? (
+                  <Section title="Bing Search Traffic" sub="Clicks, impressions and position over 90 days">
+                    <div className="mb-4">
+                      {(() => {
+                        const maxC = Math.max(...bing.queryStats.map(r => r.clicks), 1)
+                        const maxI = Math.max(...bing.queryStats.map(r => r.impressions), 1)
+                        return (
+                          <>
+                            {/* eslint-disable-next-line react/forbid-dom-props */}
+                            <div className="flex items-end gap-0.5 mb-1" style={{ height: "56px" }}>
+                              {bing.queryStats.map((r, i) => (
+                                <div key={i} className="flex-1 flex flex-col justify-end gap-px"
+                                  title={`${r.date}: ${r.clicks} clicks, ${r.impressions} impressions`}>
+                                  {/* eslint-disable-next-line react/forbid-dom-props */}
+                                  <div className="w-full bg-[#008373]/40 rounded-t-sm" style={{ height: `${(r.impressions / maxI) * 40}%` }} />
+                                  {/* eslint-disable-next-line react/forbid-dom-props */}
+                                  <div className="w-full bg-[#008373] rounded-t-sm" style={{ height: `${(r.clicks / maxC) * 60}%` }} />
+                                </div>
+                              ))}
+                            </div>
+                            <div className="flex gap-4 text-xs text-gray-600 mb-3">
+                              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[#008373] inline-block" /> Clicks</span>
+                              <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[#008373]/40 inline-block" /> Impressions</span>
+                            </div>
+                          </>
+                        )
+                      })()}
+                    </div>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
+                          <th className="text-left pb-2">Date</th>
+                          <th className="text-right pb-2">Clicks</th>
+                          <th className="text-right pb-2">Impressions</th>
+                          <th className="text-right pb-2">Avg Position</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {bing.queryStats.map((r, i) => (
+                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                            <td className="py-1.5 text-gray-800">{r.date}</td>
+                            <td className="py-1.5 text-right font-semibold text-gray-900">{fmtNum(r.clicks)}</td>
+                            <td className="py-1.5 text-right text-gray-700">{fmtNum(r.impressions)}</td>
+                            <td className="py-1.5 text-right">
+                              <span className={r.avgPosition > 0 && r.avgPosition <= 10 ? "text-green-700 font-semibold" : r.avgPosition > 0 && r.avgPosition <= 20 ? "text-amber-700" : "text-gray-700"}>
+                                {r.avgPosition > 0 ? r.avgPosition.toFixed(1) : "—"}
+                              </span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Section>
+                ) : (
+                  <Section title="Bing Search Traffic" sub="90 days">
+                    <div className="text-center py-6 text-gray-500">
+                      <p className="text-sm font-medium text-gray-700 mb-1">No Bing organic search traffic yet</p>
+                      <p className="text-xs text-gray-600">
+                        Bing has low market share in India (&lt;1%). Your pages are being crawled (see above),
+                        but Bing has not sent any organic visits. Data will appear here once Bing users click your results.
+                      </p>
+                    </div>
+                  </Section>
+                )}
+
+                {/* ── Crawl Issues + Blocked URLs ── */}
+                {(bing.crawlIssues.length > 0 || bing.blockedUrls.length > 0) && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    {bing.crawlIssues.length > 0 && (
+                      <Section title="Crawl Issues">
+                        <pre className="text-xs text-gray-800 overflow-auto max-h-40">
+                          {JSON.stringify(bing.crawlIssues, null, 2)}
+                        </pre>
+                      </Section>
+                    )}
+                    {bing.blockedUrls.length > 0 && (
+                      <Section title="Blocked URLs">
+                        {bing.blockedUrls.map((u, i) => (
+                          <p key={i} className="text-xs font-mono text-gray-800 py-0.5 border-b border-gray-100 last:border-0">{u}</p>
+                        ))}
+                      </Section>
+                    )}
+                  </div>
+                )}
+
+              </div>
+            )
+          })()}
+        </div>
+
         <p className="text-xs text-gray-700 text-center pb-4">
           * CDN unique visits are estimated per day and not deduplicated across days. Use RUM visits for accurate user counts.
           Search Console data updates daily. Page indexing is live via URL Inspection API.
+          Bing crawl data is live via Bing Webmaster Tools API.
         </p>
       </div>
     </div>

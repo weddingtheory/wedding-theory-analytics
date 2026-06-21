@@ -2,6 +2,13 @@ import { GoogleAuth } from "google-auth-library"
 import fs from "fs"
 import path from "path"
 
+function loadCredentials() {
+  if (process.env.GOOGLE_CREDENTIALS_JSON) {
+    return JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON)
+  }
+  return JSON.parse(fs.readFileSync(path.join(process.cwd(), "google-credentials.json"), "utf8"))
+}
+
 const WMT   = "https://www.googleapis.com/webmasters/v3"
 const SC_V1 = "https://searchconsole.googleapis.com/v1"
 
@@ -16,7 +23,7 @@ function buildRange(daysBack: number) {
 
 async function getToken(): Promise<string | null> {
   try {
-    const creds = JSON.parse(fs.readFileSync(path.join(process.cwd(), "google-credentials.json"), "utf8"))
+    const creds = loadCredentials()
     const auth = new GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/webmasters.readonly"] })
     const client = await auth.getClient()
     return (await client.getAccessToken()).token ?? null
