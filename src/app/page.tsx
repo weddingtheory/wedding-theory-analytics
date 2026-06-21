@@ -1,16 +1,18 @@
 import { Suspense } from "react"
 import { unstable_cache } from "next/cache"
 import { getCloudflareData } from "@/lib/cloudflare"
-import { getSearchConsoleData } from "@/lib/search-console"
+import { getSearchConsoleData, getPageInspections } from "@/lib/search-console"
 import { getBingData } from "@/lib/bing"
 import type {
   DayGroup, CountryEntry, StatusEntry, ContentEntry,
   BrowserEntry, SSLEntry, HTTPVerEntry, IPClassEntry,
 } from "@/lib/cloudflare"
 
-const cachedCloudflare = unstable_cache(getCloudflareData, ["cloudflare"], { revalidate: 3600 })
-const cachedSC         = unstable_cache(getSearchConsoleData, ["search-console"], { revalidate: 3600 })
-const cachedBing       = unstable_cache(getBingData, ["bing"], { revalidate: 3600 })
+const cachedCloudflare      = unstable_cache(getCloudflareData, ["cloudflare"], { revalidate: 3600 })
+const cachedSC              = unstable_cache(getSearchConsoleData, ["search-console"], { revalidate: 3600 })
+const cachedBing            = unstable_cache(getBingData, ["bing"], { revalidate: 3600 })
+const cachedPageInspections = (sitemapPath: string) =>
+  unstable_cache(getPageInspections, ["page-inspections", sitemapPath], { revalidate: 3600 })(sitemapPath)
 
 // ─── Formatters ───────────────────────────────────────────────────────────────
 
@@ -884,8 +886,7 @@ async function SearchConsoleSection() {
           return "text-gray-700 bg-gray-100 border border-gray-200"
         }
 
-        const indexed    = sc.pageInspections.filter(p => p.verdict === "PASS").length
-        const notIndexed = sc.pageInspections.filter(p => p.verdict !== "PASS").length
+        const firstSitemapPath = sc.sitemaps[0]?.path ?? ""
 
         return (
           <div className="space-y-6">
@@ -942,57 +943,85 @@ async function SearchConsoleSection() {
               </Section>
             )}
 
-            {sc.pageInspections.length > 0 && (
-              <Section title="Indexing — Pages" sub="Indexing → Pages · live URL Inspection per sitemap entry">
-                <div className="flex gap-3 mb-4">
-                  <span className="text-sm font-semibold text-green-800 bg-green-100 border border-green-300 px-3 py-1 rounded-full">
-                    {indexed} Indexed
-                  </span>
-                  {notIndexed > 0 && (
-                    <span className="text-sm font-semibold text-amber-800 bg-amber-100 border border-amber-300 px-3 py-1 rounded-full">
-                      {notIndexed} Not yet indexed
-                    </span>
-                  )}
-                </div>
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                      <th className="text-left pb-2">Page URL</th>
-                      <th className="text-center pb-2">Status</th>
-                      <th className="text-left pb-2">Coverage State</th>
-                      <th className="text-right pb-2">Last Crawled</th>
-                      <th className="text-center pb-2">Crawled As</th>
-                      <th className="text-center pb-2">Mobile</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sc.pageInspections.map((p, i) => {
-                      const pagePath = p.url.replace(/^https?:\/\/[^/]+/, "") || "/"
-                      const mob    = p.mobileVerdict === "PASS" ? "✓" : p.mobileVerdict === "FAIL" ? "✗" : "—"
-                      const mobCls = p.mobileVerdict === "PASS" ? "text-green-700 font-bold" : p.mobileVerdict === "FAIL" ? "text-red-700 font-bold" : "text-gray-500"
-                      return (
-                        <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                          <td className="py-2 font-mono text-xs text-gray-900 max-w-[220px] truncate" title={p.url}>{pagePath}</td>
-                          <td className="py-2 text-center">
-                            <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${verdictBadge(p.verdict)}`}>
-                              {p.verdict === "PASS" ? "Indexed" : p.verdict === "FAIL" ? "Error" : "Not indexed"}
-                            </span>
-                          </td>
-                          <td className="py-2 text-xs text-gray-800">{p.coverageState}</td>
-                          <td className="py-2 text-right text-gray-800">{p.lastCrawlTime ? p.lastCrawlTime.slice(0,10) : <span className="text-gray-400">Never</span>}</td>
-                          <td className="py-2 text-center text-xs text-gray-700 capitalize">{p.crawledAs?.toLowerCase() || "—"}</td>
-                          <td className={`py-2 text-center text-sm ${mobCls}`}>{mob}</td>
-                        </tr>
-                      )
-                    })}
-                  </tbody>
-                </table>
-              </Section>
+            {/* Page inspections load separately so they don't block the rest */}
+            {firstSitemapPath && (
+              <Suspense fallback={
+                <Section title="Indexing — Pages" sub="loading…">
+                  <TableSkel rows={8} />
+                </Section>
+              }>
+                <PageInspectionSection sitemapPath={firstSitemapPath} />
+              </Suspense>
             )}
           </div>
         )
       })()}
     </div>
+  )
+}
+
+// ─── Page Inspection Section (slow — streams in after SC analytics) ───────────
+
+async function PageInspectionSection({ sitemapPath }: { sitemapPath: string }) {
+  const inspections = await cachedPageInspections(sitemapPath)
+  if (inspections.length === 0) return null
+
+  const verdictBadge = (v: string) => {
+    if (v === "PASS")    return "text-green-800 bg-green-100 border border-green-300"
+    if (v === "FAIL")    return "text-red-800 bg-red-100 border border-red-300"
+    if (v === "NEUTRAL") return "text-amber-800 bg-amber-100 border border-amber-300"
+    return "text-gray-700 bg-gray-100 border border-gray-200"
+  }
+
+  const indexed    = inspections.filter(p => p.verdict === "PASS").length
+  const notIndexed = inspections.filter(p => p.verdict !== "PASS").length
+
+  return (
+    <Section title="Indexing — Pages" sub="Indexing → Pages · live URL Inspection per sitemap entry">
+      <div className="flex gap-3 mb-4">
+        <span className="text-sm font-semibold text-green-800 bg-green-100 border border-green-300 px-3 py-1 rounded-full">
+          {indexed} Indexed
+        </span>
+        {notIndexed > 0 && (
+          <span className="text-sm font-semibold text-amber-800 bg-amber-100 border border-amber-300 px-3 py-1 rounded-full">
+            {notIndexed} Not yet indexed
+          </span>
+        )}
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
+            <th className="text-left pb-2">Page URL</th>
+            <th className="text-center pb-2">Status</th>
+            <th className="text-left pb-2">Coverage State</th>
+            <th className="text-right pb-2">Last Crawled</th>
+            <th className="text-center pb-2">Crawled As</th>
+            <th className="text-center pb-2">Mobile</th>
+          </tr>
+        </thead>
+        <tbody>
+          {inspections.map((p, i) => {
+            const pagePath = p.url.replace(/^https?:\/\/[^/]+/, "") || "/"
+            const mob    = p.mobileVerdict === "PASS" ? "✓" : p.mobileVerdict === "FAIL" ? "✗" : "—"
+            const mobCls = p.mobileVerdict === "PASS" ? "text-green-700 font-bold" : p.mobileVerdict === "FAIL" ? "text-red-700 font-bold" : "text-gray-500"
+            return (
+              <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
+                <td className="py-2 font-mono text-xs text-gray-900 max-w-[220px] truncate" title={p.url}>{pagePath}</td>
+                <td className="py-2 text-center">
+                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${verdictBadge(p.verdict)}`}>
+                    {p.verdict === "PASS" ? "Indexed" : p.verdict === "FAIL" ? "Error" : "Not indexed"}
+                  </span>
+                </td>
+                <td className="py-2 text-xs text-gray-800">{p.coverageState}</td>
+                <td className="py-2 text-right text-gray-800">{p.lastCrawlTime ? p.lastCrawlTime.slice(0,10) : <span className="text-gray-400">Never</span>}</td>
+                <td className="py-2 text-center text-xs text-gray-700 capitalize">{p.crawledAs?.toLowerCase() || "—"}</td>
+                <td className={`py-2 text-center text-sm ${mobCls}`}>{mob}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </Section>
   )
 }
 

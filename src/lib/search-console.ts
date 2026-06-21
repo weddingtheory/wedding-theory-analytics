@@ -200,7 +200,7 @@ function parseInspection(url: string, j: Record<string, unknown>): PageInspectio
   }
 }
 
-// ─── Main fetch ───────────────────────────────────────────────────────────────
+// ─── Main fetch (analytics + sitemaps — fast, all parallel) ──────────────────
 
 export async function getSearchConsoleData(): Promise<SCData | null> {
   const siteUrl = process.env.GOOGLE_SITE_URL?.trim()
@@ -217,7 +217,6 @@ export async function getSearchConsoleData(): Promise<SCData | null> {
     sitemaps: [], pageInspections: [],
   }
 
-  // Fetch all search types + sitemaps in parallel
   const [webData, imageData, videoData, newsData, smRaw] = await Promise.all([
     fetchType(token, siteUrl, "web"),
     fetchType(token, siteUrl, "image"),
@@ -226,7 +225,6 @@ export async function getSearchConsoleData(): Promise<SCData | null> {
     wmtGet(token, `/sites/${encodeURIComponent(siteUrl)}/sitemaps`),
   ])
 
-  // Parse sitemaps
   const sitemaps: Sitemap[] = ((smRaw as { sitemap?: Record<string, unknown>[] })?.sitemap ?? []).map(s => ({
     path:            String(s.path          ?? ""),
     lastSubmitted:   String(s.lastSubmitted ?? ""),
@@ -240,20 +238,28 @@ export async function getSearchConsoleData(): Promise<SCData | null> {
     indexed:         Number((s.contents as { indexed?: string   }[])?.[0]?.indexed   ?? 0),
   }))
 
-  // Fetch sitemap URLs and inspect each page
-  const firstSitemap = sitemaps[0]?.path ?? ""
-  const sitemapUrls  = firstSitemap ? await fetchSitemapUrls(firstSitemap) : []
-
-  const pageInspections: PageInspection[] = []
-  for (const url of sitemapUrls.slice(0, 10)) {
-    const j = await inspectUrl(token, url, siteUrl)
-    if (j) pageInspections.push(parseInspection(url, j))
-    await new Promise(r => setTimeout(r, 150))
-  }
-
   return {
     ok: true, startDate, endDate,
     web: webData, image: imageData, video: videoData, news: newsData,
-    sitemaps, pageInspections,
+    sitemaps, pageInspections: [],
   }
+}
+
+// ─── Page inspection fetch (slow — sequential per Google rate limits) ─────────
+
+export async function getPageInspections(sitemapPath: string): Promise<PageInspection[]> {
+  const siteUrl = process.env.GOOGLE_SITE_URL?.trim()
+  if (!siteUrl || !sitemapPath) return []
+
+  const token = await getToken()
+  if (!token) return []
+
+  const sitemapUrls = await fetchSitemapUrls(sitemapPath)
+  const inspections: PageInspection[] = []
+  for (const url of sitemapUrls.slice(0, 10)) {
+    const j = await inspectUrl(token, url, siteUrl)
+    if (j) inspections.push(parseInspection(url, j))
+    await new Promise(r => setTimeout(r, 150))
+  }
+  return inspections
 }
