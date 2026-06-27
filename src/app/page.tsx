@@ -3,10 +3,11 @@ import { unstable_cache } from "next/cache"
 import { getCloudflareData } from "@/lib/cloudflare"
 import { getSearchConsoleData, getPageInspections } from "@/lib/search-console"
 import { getBingData } from "@/lib/bing"
-import type {
-  DayGroup, CountryEntry, StatusEntry, ContentEntry,
-  BrowserEntry, SSLEntry, HTTPVerEntry, IPClassEntry,
-} from "@/lib/cloudflare"
+import { DateFilter } from "@/components/DateFilter"
+import { SparklineCard } from "@/components/SparklineCard"
+import { SingleLineChart, SCChart } from "@/components/TrafficChart"
+import { DonutChartsRow, DonutChart } from "@/components/DonutCharts"
+import { WorldMap } from "@/components/WorldMap"
 
 const cachedCloudflare      = unstable_cache(getCloudflareData, ["cloudflare"], { revalidate: 3600 })
 const cachedSC              = unstable_cache(getSearchConsoleData, ["search-console"], { revalidate: 3600 })
@@ -27,10 +28,6 @@ function fmtBytes(b: number) {
   if (b >= 1_024)         return (b / 1_024).toFixed(1) + " KB"
   return b + " B"
 }
-function fmtUs(us: number) {
-  const ms = us / 1000
-  return ms >= 1000 ? (ms / 1000).toFixed(2) + "s" : Math.round(ms) + "ms"
-}
 function pct(part: number, total: number) {
   return total > 0 ? ((part / total) * 100).toFixed(1) + "%" : "—"
 }
@@ -38,1172 +35,742 @@ function flag(code: string) {
   if (!code || code.length !== 2) return "🌍"
   return [...code.toUpperCase()].map(c => String.fromCodePoint(0x1F1E6 + c.charCodeAt(0) - 65)).join("")
 }
-
-// ─── HTTP map aggregation ─────────────────────────────────────────────────────
-
-function aggMap<T>(
-  days: DayGroup[], field: keyof DayGroup["sum"], keyField: keyof T, valueField: keyof T,
-): { key: string; value: number }[] {
-  const m = new Map<string, number>()
-  for (const day of days)
-    for (const e of (day.sum[field] as unknown as T[]))
-      m.set(String(e[keyField]), (m.get(String(e[keyField])) ?? 0) + Number(e[valueField]))
-  return [...m.entries()].map(([key, value]) => ({ key, value })).sort((a, b) => b.value - a.value)
+function changePct(curr: number, prev: number) {
+  if (prev === 0) return 0
+  return ((curr - prev) / prev) * 100
 }
 
-function aggCountries(days: DayGroup[]) {
-  const m = new Map<string, { requests: number; threats: number; bytes: number }>()
-  for (const day of days)
-    for (const e of day.sum.countryMap) {
-      const x = m.get(e.clientCountryName) ?? { requests: 0, threats: 0, bytes: 0 }
-      m.set(e.clientCountryName, { requests: x.requests + e.requests, threats: x.threats + e.threats, bytes: x.bytes + e.bytes })
-    }
-  return [...m.entries()].map(([name, v]) => ({ name, ...v })).sort((a, b) => b.requests - a.requests)
+// ─── SC country alpha-3 → alpha-2 ────────────────────────────────────────────
+// Google Search Console returns ISO 3166-1 alpha-3 (3-letter) codes in lowercase
+
+const SC_A3_TO_A2: Record<string, string> = {
+  "afg":"AF","alb":"AL","dza":"DZ","ago":"AO","arg":"AR","aus":"AU","aut":"AT",
+  "bgd":"BD","bel":"BE","bra":"BR","bgr":"BG","khm":"KH","cmr":"CM","can":"CA",
+  "lka":"LK","chl":"CL","chn":"CN","col":"CO","cod":"CD","hrv":"HR","cze":"CZ",
+  "dnk":"DK","eth":"ET","fin":"FI","fra":"FR","deu":"DE","gha":"GH","grc":"GR",
+  "gtm":"GT","ind":"IN","idn":"ID","irn":"IR","irq":"IQ","irl":"IE","isr":"IL",
+  "ita":"IT","jpn":"JP","jor":"JO","ken":"KE","kor":"KR","kwt":"KW","lva":"LV",
+  "ltu":"LT","mys":"MY","mex":"MX","mar":"MA","omn":"OM","npl":"NP","nld":"NL",
+  "nzl":"NZ","nga":"NG","nor":"NO","pak":"PK","per":"PE","phl":"PH","pol":"PL",
+  "prt":"PT","pri":"PR","qat":"QA","rou":"RO","rus":"RU","sau":"SA","sgp":"SG",
+  "svk":"SK","svn":"SI","zaf":"ZA","zwe":"ZW","esp":"ES","swe":"SE","che":"CH",
+  "tha":"TH","tun":"TN","tur":"TR","ukr":"UA","are":"AE","gbr":"GB","usa":"US",
+  "ury":"UY","ven":"VE","vnm":"VN","yem":"YE","bhr":"BH","est":"EE","mlt":"MT",
+  "mng":"MN","mmr":"MM","lbn":"LB","jor":"JO","cri":"CR","pry":"PY","bol":"BO",
+  "ecu":"EC","dom":"DO","gtm":"GT","hnk":"HK","twn":"TW","aze":"AZ","geo":"GE",
+  "arm":"AM","kaz":"KZ","uzb":"UZ","bih":"BA","srb":"RS","mkd":"MK","alg":"DZ",
+  "mac":"MO","khm":"KH","lao":"LA","khm":"KH",
 }
 
-// ─── Status code helpers ──────────────────────────────────────────────────────
+// ─── UI primitives ────────────────────────────────────────────────────────────
 
-function statusBg(s: number)    { return s < 300 ? "bg-green-500" : s < 400 ? "bg-blue-500" : s < 500 ? "bg-amber-500" : "bg-red-500" }
-function statusBadge(s: number) { return s < 300 ? "text-green-700 bg-green-50 ring-green-200" : s < 400 ? "text-blue-700 bg-blue-50 ring-blue-200" : s < 500 ? "text-amber-700 bg-amber-50 ring-amber-200" : "text-red-700 bg-red-50 ring-red-200" }
-
-// ─── Core Web Vitals scoring ──────────────────────────────────────────────────
-
-function vitalsScore(metric: string, usValue: number): "good" | "needs" | "poor" {
-  const msValue = metric === "cls" ? usValue : usValue / 1000
-  const thresholds: Record<string, [number, number]> = {
-    lcp:  [2500, 4000],
-    fcp:  [1800, 3000],
-    ttfb: [800,  1800],
-    inp:  [200,  500],
-    fid:  [100,  300],
-    cls:  [0.1,  0.25],
-    plt:  [2500, 5000],
-  }
-  const [good, poor] = thresholds[metric] ?? [0, Infinity]
-  return msValue <= good ? "good" : msValue <= poor ? "needs" : "poor"
-}
-function scoreCls(s: "good"|"needs"|"poor") {
-  return s === "good" ? "text-green-600 bg-green-50 border-green-200" : s === "needs" ? "text-amber-600 bg-amber-50 border-amber-200" : "text-red-600 bg-red-50 border-red-200"
-}
-function scoreDot(s: "good"|"needs"|"poor") {
-  return s === "good" ? "bg-green-500" : s === "needs" ? "bg-amber-500" : "bg-red-500"
-}
-
-// ─── UI Primitives ────────────────────────────────────────────────────────────
-
-function Section({ title, sub, children }: { title: string; sub?: string; children: React.ReactNode }) {
+function SectionHeader({ number, title }: { number: string; title: string }) {
   return (
-    <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-      <div className="px-5 py-3 border-b border-gray-100 bg-gray-50 flex items-baseline gap-2">
-        <h2 className="text-xs font-semibold text-gray-800 uppercase tracking-wider">{title}</h2>
-        {sub && <span className="text-xs text-gray-600">{sub}</span>}
-      </div>
-      <div className="p-5">{children}</div>
+    <div className="flex items-center gap-3 mb-6">
+      <span className="text-xs font-bold font-mono px-2 py-1 rounded bg-white/[0.06] border border-white/[0.08] text-white/50 tracking-widest">
+        {number}
+      </span>
+      <h2 className="text-sm font-semibold text-white/60 uppercase tracking-[0.14em]">{title}</h2>
+      <div className="flex-1 h-px bg-[#222]" />
     </div>
   )
 }
 
-function Bar({ label, value, max, note, color = "bg-blue-500" }: {
-  label: string; value: number; max: number; note?: string; color?: string
-}) {
-  const w = max > 0 ? Math.max((value / max) * 100, 1) : 0
+function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
-    <div className="mb-3 last:mb-0">
-      <div className="flex justify-between text-sm mb-1">
-        <span className="text-gray-900 truncate max-w-[65%]" title={label}>{label || "Unknown"}</span>
-        <span className="text-gray-700 text-xs shrink-0 font-medium">{note ?? fmtNum(value)}</span>
-      </div>
-      <div className="h-1.5 bg-gray-100 rounded-full">
-        {/* eslint-disable-next-line react/forbid-dom-props */}
-        <div className={`h-full ${color} rounded-full`} style={{ width: `${w}%` }} />
-      </div>
+    <div className={`rounded-xl border border-[#222] bg-[#111] ${className}`}>
+      {children}
     </div>
   )
 }
 
-function StatCard({ label, value, sub, color = "text-gray-900" }: {
-  label: string; value: string; sub?: string; color?: string
-}) {
+function CardHeader({ title, sub }: { title: string; sub?: string }) {
   return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5">
-      <p className="text-xs text-gray-600 uppercase tracking-wide font-semibold mb-1">{label}</p>
-      <p className={`text-2xl font-semibold ${color}`}>{value}</p>
-      {sub && <p className="text-xs text-gray-700 mt-0.5">{sub}</p>}
+    <div className="px-5 pt-5 pb-4 border-b border-[#1a1a1a] flex items-baseline gap-2">
+      <h3 className="text-xs font-semibold text-white/55 uppercase tracking-[0.1em]">{title}</h3>
+      {sub && <span className="text-xs text-white/30">{sub}</span>}
     </div>
   )
 }
 
-function VitalCard({ name, metric, p50, p75, p90, isCls = false }: {
-  name: string; metric: string; p50: number; p75: number; p90: number; isCls?: boolean
-}) {
-  const fmt = isCls ? (v: number) => v.toFixed(3) : fmtUs
-  const score = vitalsScore(metric, p75)
-  const borderCls = score === "good" ? "border-green-300" : score === "needs" ? "border-amber-300" : "border-red-300"
-  const bgCls     = score === "good" ? "bg-green-50"     : score === "needs" ? "bg-amber-50"     : "bg-red-50"
-  const labelCls  = score === "good" ? "text-green-800"  : score === "needs" ? "text-amber-800"  : "text-red-800"
-  const badgeCls  = score === "good"
-    ? "text-green-800 bg-green-100 border-green-300"
-    : score === "needs"
-    ? "text-amber-800 bg-amber-100 border-amber-300"
-    : "text-red-800 bg-red-100 border-red-300"
+function Th({ children, right }: { children: React.ReactNode; right?: boolean }) {
   return (
-    <div className={`rounded-xl border p-4 ${bgCls} ${borderCls}`}>
-      <div className="flex items-center justify-between mb-2">
-        <span className={`text-xs font-bold uppercase tracking-wide ${labelCls}`}>{name}</span>
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${badgeCls}`}>
-          {score === "good" ? "Good" : score === "needs" ? "Needs work" : "Poor"}
-        </span>
+    <th className={`pb-3 text-xs font-medium text-white/35 uppercase tracking-[0.08em] ${right ? "text-right" : "text-left"}`}>
+      {children}
+    </th>
+  )
+}
+
+function Td({ children, right, mono }: { children: React.ReactNode; right?: boolean; mono?: boolean }) {
+  return (
+    <td className={`py-3 text-sm border-b border-[#1a1a1a] ${right ? "text-right" : ""} ${mono ? "font-mono text-xs text-white/55" : ""}`}>
+      {children}
+    </td>
+  )
+}
+
+function PositionBadge({ pos }: { pos: number }) {
+  const cls = pos <= 3 ? "text-emerald-400" : pos <= 10 ? "text-green-400" : pos <= 20 ? "text-amber-400" : "text-white/50"
+  return <span className={`font-bold tabular-nums text-sm ${cls}`}>{pos.toFixed(1)}</span>
+}
+
+function CountryRow({ code, pct, maxPct, color }: { code: string; pct: number; maxPct: number; color: string }) {
+  return (
+    <div className="flex items-center gap-3 text-sm">
+      <span className="w-5 text-center shrink-0 text-base">{flag(code)}</span>
+      <span className="flex-1 text-white/65 truncate font-medium">{code}</span>
+      <div className="w-20 h-[3px] bg-[#1a1a1a] rounded-full overflow-hidden shrink-0">
+        <div className="h-full rounded-full" style={{ width: `${(pct / maxPct) * 100}%`, background: color }} />
       </div>
-      <p className="text-2xl font-bold text-gray-900">{fmt(p75)}</p>
-      <p className="text-xs text-gray-600 mb-3">p75 (last 7 days)</p>
-      <div className="space-y-1.5 text-xs text-gray-700">
-        {([["p50", p50], ["p75", p75], ["p90", p90]] as [string, number][]).map(([label, val]) => (
-          <div key={label} className="flex justify-between">
-            <span className="font-medium">{label}</span>
-            <div className="flex items-center gap-1.5">
-              <div className={`w-1.5 h-1.5 rounded-full ${scoreDot(vitalsScore(metric, val))}`} />
-              <span className="font-semibold text-gray-900">{fmt(val)}</span>
-            </div>
-          </div>
-        ))}
-      </div>
+      <span className="w-11 text-right font-semibold text-white/80 tabular-nums shrink-0">{pct.toFixed(1)}%</span>
     </div>
   )
 }
 
-// ─── Skeletons ────────────────────────────────────────────────────────────────
+// ─── Skeleton ─────────────────────────────────────────────────────────────────
 
 function Pulse({ className }: { className: string }) {
-  return <div className={`bg-gray-200 rounded animate-pulse ${className}`} />
+  return <div className={`bg-white/[0.04] rounded-lg animate-pulse ${className}`} />
 }
 
-function CardSkel() {
+function SectionSkeleton() {
   return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-2">
-      <Pulse className="h-3 w-24" />
-      <Pulse className="h-7 w-32" />
-      <Pulse className="h-2 w-20" />
-    </div>
-  )
-}
-
-function TableSkel({ rows = 7 }: { rows?: number }) {
-  return (
-    <div className="space-y-2">
-      {Array.from({ length: rows }).map((_, i) => (
-        <Pulse key={i} className="h-8 w-full" />
-      ))}
-    </div>
-  )
-}
-
-function CloudflareSkeleton() {
-  return (
-    <div className="space-y-8">
-      <div>
-        <Pulse className="h-3 w-56 mb-3" />
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          {Array.from({ length: 8 }).map((_, i) => <CardSkel key={i} />)}
-        </div>
+    <div className="space-y-6">
+      <div className="flex items-center gap-3">
+        <Pulse className="h-6 w-12" />
+        <Pulse className="h-5 w-48" />
+        <div className="flex-1 h-px bg-[#222]" />
       </div>
-      <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
-        <Pulse className="h-3 w-40" />
-        <Pulse className="h-16 w-full" />
-        <TableSkel />
-      </div>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {[0, 1].map(i => (
-          <div key={i} className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
-            <Pulse className="h-3 w-32" />
-            <TableSkel rows={5} />
+      <div className="grid grid-cols-3 gap-4">
+        {Array.from({ length: 3 }).map((_, i) => (
+          <div key={i} className="bg-[#111] rounded-xl border border-[#222] p-5 space-y-3">
+            <Pulse className="h-3 w-24" />
+            <Pulse className="h-8 w-32" />
+            <Pulse className="h-14 w-full" />
           </div>
         ))}
       </div>
-    </div>
-  )
-}
-
-function SearchConsoleSkeleton() {
-  return (
-    <div className="border-t-2 border-gray-300 pt-8 space-y-6">
-      <div className="flex items-center gap-3">
-        <div className="w-6 h-6 rounded-full bg-gray-200 animate-pulse" />
-        <Pulse className="h-6 w-52" />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {Array.from({ length: 4 }).map((_, i) => <CardSkel key={i} />)}
-      </div>
-      <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
-        <Pulse className="h-3 w-40" />
-        <Pulse className="h-14 w-full" />
-        <TableSkel rows={10} />
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-[#111] rounded-xl border border-[#222] p-5">
+          <Pulse className="h-4 w-40 mb-4" />
+          <Pulse className="h-44 w-full" />
+        </div>
+        <div className="bg-[#111] rounded-xl border border-[#222] p-5">
+          <Pulse className="h-4 w-32 mb-4" />
+          <Pulse className="h-44 w-full" />
+        </div>
       </div>
     </div>
   )
 }
 
-function BingSkeleton() {
-  return (
-    <div className="border-t-2 border-gray-300 pt-8 space-y-6">
-      <div className="flex items-center gap-3">
-        <div className="w-6 h-6 rounded-full bg-gray-200 animate-pulse" />
-        <Pulse className="h-6 w-48" />
-      </div>
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {Array.from({ length: 4 }).map((_, i) => <CardSkel key={i} />)}
-      </div>
-      <div className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
-        <Pulse className="h-3 w-40" />
-        <TableSkel rows={8} />
-      </div>
-    </div>
-  )
-}
-
-// ─── Cloudflare Section ───────────────────────────────────────────────────────
+// ─── Section 1: Website Traffic ───────────────────────────────────────────────
 
 async function CloudflareSection() {
   const data = await cachedCloudflare()
   if (!data) return (
-    <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+    <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-400">
       Failed to fetch Cloudflare data. Check API credentials in .env
     </div>
   )
 
-  const {
-    days, topPaths, topDevices,
-    rumDays, rumPerfDays, rumVitalsDays,
-    rumCountries, rumBrowsers, rumOS, rumDevices, rumPaths, rumReferers,
-    errors, siteTag,
-  } = data
+  const { rumBrowsers, rumOS, rumDevices, rumPaths, rumReferers, errors } = data
+  const allDays    = data.days
+  const allRumDays = data.rumDays
+
+  const days        = allDays.length >= 14    ? allDays.slice(-7)    : allDays
+  const prevDays    = allDays.length >= 14    ? allDays.slice(0, 7)  : []
+  const rumDays     = allRumDays.length >= 14 ? allRumDays.slice(-7) : allRumDays
+  const prevRumDays = allRumDays.length >= 14 ? allRumDays.slice(0, 7) : []
 
   const H = days.reduce((a, d) => ({
     requests:       a.requests       + d.sum.requests,
-    pageViews:      a.pageViews      + d.sum.pageViews,
-    bytes:          a.bytes          + d.sum.bytes,
-    cachedBytes:    a.cachedBytes    + d.sum.cachedBytes,
     cachedRequests: a.cachedRequests + d.sum.cachedRequests,
-    encReq:         a.encReq         + d.sum.encryptedRequests,
-    encBytes:       a.encBytes       + d.sum.encryptedBytes,
-    threats:        a.threats        + d.sum.threats,
     uniques:        a.uniques        + d.uniq.uniques,
-  }), { requests: 0, pageViews: 0, bytes: 0, cachedBytes: 0, cachedRequests: 0, encReq: 0, encBytes: 0, threats: 0, uniques: 0 })
+  }), { requests: 0, cachedRequests: 0, uniques: 0 })
 
-  const R = rumDays.reduce((a, d) => ({ visits: a.visits + d.sum.visits, pageViews: a.pageViews + d.count }),
-    { visits: 0, pageViews: 0 })
+  const Hprev = prevDays.reduce((a, d) => ({
+    requests: a.requests + d.sum.requests,
+    uniques:  a.uniques  + d.uniq.uniques,
+  }), { requests: 0, uniques: 0 })
 
-  const countries = aggCountries(days)
-  const statuses  = aggMap<StatusEntry>(days, "responseStatusMap", "edgeResponseStatus", "requests")
-  const content   = aggMap<ContentEntry>(days, "contentTypeMap", "edgeResponseContentTypeName", "requests")
-  const browsers  = aggMap<BrowserEntry>(days, "browserMap", "uaBrowserFamily", "pageViews")
-  const ssl       = aggMap<SSLEntry>(days, "clientSSLMap", "clientSSLProtocol", "requests")
-  const httpVer   = aggMap<HTTPVerEntry>(days, "clientHTTPVersionMap", "clientHTTPProtocol", "requests")
-  const ipClass   = aggMap<IPClassEntry>(days, "ipClassMap", "ipType", "requests")
+  const rumCurr = { visits: rumDays.reduce((a, d) => a + d.sum.visits, 0), pageViews: rumDays.reduce((a, d) => a + d.count, 0) }
+  const rumPrev = { visits: prevRumDays.reduce((a, d) => a + d.sum.visits, 0), pageViews: prevRumDays.reduce((a, d) => a + d.count, 0) }
 
-  const maxReq    = Math.max(...days.map(d => d.sum.requests), 1)
-  const hasRUM    = rumDays.length > 0
-  const hasPerf   = rumPerfDays.length > 0
-  const hasVitals = rumVitalsDays.length > 0
+  const hasRUM  = rumDays.length > 0
+  const currPPV = rumCurr.visits > 0 ? rumCurr.pageViews / rumCurr.visits : 0
+  const prevPPV = rumPrev.visits  > 0 ? rumPrev.pageViews / rumPrev.visits : 0
 
-  const latestPerf   = rumPerfDays[rumPerfDays.length - 1]
-  const latestVitals = rumVitalsDays[rumVitalsDays.length - 1]
+  const reqSpark   = days.map(d => d.sum.requests)
+  const visitSpark = rumDays.map(d => d.sum.visits)
+  const ppvSpark   = rumDays.map(d => d.sum.visits > 0 ? d.count / d.sum.visits : 0)
+
+  const trafficData = days.map((d, i) => ({
+    date:     d.dimensions.date,
+    requests: d.sum.requests,
+    visits:   rumDays[i]?.sum.visits ?? 0,
+  }))
+
+  const rumCountriesData = data.rumCountries
+  const totalVisits  = rumCountriesData.reduce((s, c) => s + c.sum.visits, 0)
+  const mapCountries = rumCountriesData.map(c => ({
+    code:   c.dimensions.countryName,
+    visits: c.sum.visits,
+    pct:    totalVisits > 0 ? (c.sum.visits / totalVisits) * 100 : 0,
+  }))
+  const topMapCountries = mapCountries.slice(0, 8)
+  const maxCountryPct   = topMapCountries[0]?.pct ?? 1
+
+  const totalRefVisits = rumReferers.reduce((s, r) => s + r.sum.visits, 0)
+
+  const devicesData  = rumDevices.map(d => ({ name: d.dimensions.deviceType || "Unknown",        value: d.sum.visits }))
+  const browsersData = rumBrowsers.map(b => ({ name: b.dimensions.userAgentBrowser || "Unknown", value: b.sum.visits }))
+  const osData       = rumOS.map(o =>        ({ name: o.dimensions.userAgentOS || "Unknown",      value: o.sum.visits }))
 
   return (
-    <div className="space-y-8">
-      {/* siteTag + errors inline */}
-      <div className="flex items-center justify-between">
-        <p className="text-xs text-gray-500">Cloudflare — last 7 days · siteTag: {siteTag ?? "not found"}</p>
-        {errors.length > 0 && (
-          <details className="text-xs text-amber-600">
-            <summary className="cursor-pointer bg-amber-50 border border-amber-200 px-3 py-1.5 rounded-lg">
-              ⚠ {errors.length} API error(s)
-            </summary>
-            <pre className="mt-2 bg-gray-900 text-red-400 p-3 rounded text-xs max-w-xl overflow-auto">
-              {JSON.stringify(errors, null, 2)}
-            </pre>
-          </details>
-        )}
+    <section className="space-y-5">
+      <SectionHeader number="01" title="Website Traffic" />
+
+      {/* Stat Cards */}
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <SparklineCard label="Total Requests" value={fmtNum(H.requests)}
+          change={prevDays.length ? changePct(H.requests, Hprev.requests) : undefined}
+          data={reqSpark} color="#818cf8" gradientId="grad-req" sub="CDN layer · 7 days" />
+        <SparklineCard label="Unique Visitors"
+          value={hasRUM ? fmtNum(rumCurr.visits) : fmtNum(H.uniques)}
+          change={hasRUM && prevRumDays.length ? changePct(rumCurr.visits, rumPrev.visits) : prevDays.length ? changePct(H.uniques, Hprev.uniques) : undefined}
+          data={hasRUM ? visitSpark : days.map(d => d.uniq.uniques)}
+          color="#34d399" gradientId="grad-vis"
+          sub={hasRUM ? "RUM sessions · 7 days" : "CDN estimate · 7 days"} />
+        <SparklineCard label="Pages Per Visit"
+          value={hasRUM ? currPPV.toFixed(2) : "—"}
+          change={hasRUM && prevPPV > 0 ? changePct(currPPV, prevPPV) : undefined}
+          data={hasRUM ? ppvSpark : []} color="#fbbf24" gradientId="grad-ppv"
+          sub={hasRUM ? "Avg page views per session" : "Requires RUM beacon"} />
       </div>
 
-      {/* HTTP Overview */}
-      <div>
-        <p className="text-xs font-semibold text-gray-700 uppercase tracking-wider mb-3">HTTP Traffic (CDN layer — 7 days)</p>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard label="Total Requests"    value={fmtNum(H.requests)} />
-          <StatCard label="Page Views (CDN)"  value={fmtNum(H.pageViews)} />
-          <StatCard label="Bandwidth"         value={fmtBytes(H.bytes)} />
-          <StatCard label="Threats Blocked"   value={fmtNum(H.threats)} color={H.threats > 0 ? "text-red-600" : "text-gray-900"} />
-          <StatCard label="Cache Hit Rate"    value={pct(H.cachedRequests, H.requests)} sub={fmtBytes(H.cachedBytes) + " saved"} />
-          <StatCard label="HTTPS Rate"        value={pct(H.encReq, H.requests)} sub={fmtBytes(H.encBytes) + " encrypted"} />
-          <StatCard label="Cached Bandwidth"  value={pct(H.cachedBytes, H.bytes)} />
-          <StatCard label="CDN Unique Visits" value={fmtNum(H.uniques)} sub="Per-day estimate, not deduplicated" />
-        </div>
+      {/* Requests + Visitors — separate charts */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <Card>
+          <CardHeader title="Total Requests" sub="CDN · 7 days" />
+          <div className="p-5 h-52">
+            <SingleLineChart data={trafficData} dataKey="requests" name="Requests" color="#818cf8" />
+          </div>
+        </Card>
+        <Card>
+          <CardHeader title="Unique Visitors" sub="RUM sessions · 7 days" />
+          <div className="p-5 h-52">
+            <SingleLineChart data={trafficData} dataKey="visits" name="Visitors" color="#34d399" />
+          </div>
+        </Card>
       </div>
 
-      {/* RUM Overview */}
-      {hasRUM ? (
-        <div>
-          <p className="text-xs font-semibold text-gray-700 uppercase tracking-wider mb-3">Web Analytics (Real User Monitoring — 7 days)</p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatCard label="Visits (sessions)"  value={fmtNum(R.visits)}    sub="Deduplicated user sessions" />
-            <StatCard label="Page Views (RUM)"   value={fmtNum(R.pageViews)} sub="JS beacon page loads" />
-            <StatCard label="Pages / Visit"      value={R.visits > 0 ? (R.pageViews / R.visits).toFixed(1) : "—"} />
-            <StatCard label="RUM Sample Events"  value={fmtNum(rumDays.reduce((a, d) => a + d.count, 0))} />
+      {/* World Map — full card with inline country list */}
+      <Card>
+        <CardHeader title="Visitors by Country" sub="RUM · 7 days" />
+        <div className="grid grid-cols-1 lg:grid-cols-5">
+          <div className="lg:col-span-3 p-4" style={{ height: "460px" }}>
+            <WorldMap countries={mapCountries} accentColor="#818cf8" />
           </div>
-        </div>
-      ) : (
-        <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 text-sm text-amber-700">
-          Web Analytics beacon not returning data yet. Data typically appears within a few hours of traffic.
-        </div>
-      )}
-
-      {/* Performance Vitals */}
-      {hasPerf && latestPerf && (
-        <div>
-          <p className="text-xs font-semibold text-gray-700 uppercase tracking-wider mb-3">Page Load Performance</p>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <VitalCard name="Page Load Time" metric="plt"
-              p50={latestPerf.quantiles.pageLoadTimeP50}
-              p75={latestPerf.quantiles.pageLoadTimeP75}
-              p90={latestPerf.quantiles.pageLoadTimeP90} />
-            <VitalCard name="First Contentful Paint" metric="fcp"
-              p50={latestPerf.quantiles.firstContentfulPaintP50}
-              p75={latestPerf.quantiles.firstContentfulPaintP75}
-              p90={latestPerf.quantiles.firstContentfulPaintP90} />
-            <div className="bg-white rounded-xl border border-gray-200 p-4">
-              <p className="text-xs font-bold uppercase tracking-wide text-gray-500 mb-2">Connection Time</p>
-              <p className="text-2xl font-bold text-gray-900">{fmtUs(latestPerf.quantiles.connectionTimeP50)}</p>
-              <p className="text-xs text-gray-600 mb-3">p50</p>
-              <div className="space-y-1 text-xs">
-                <div className="flex justify-between"><span className="text-gray-700">DNS</span><span className="font-semibold text-gray-900">{fmtUs(latestPerf.quantiles.dnsTimeP50)}</span></div>
-                <div className="flex justify-between"><span className="text-gray-700">Request</span><span className="font-semibold text-gray-900">{fmtUs(latestPerf.quantiles.requestTimeP50)}</span></div>
-                <div className="flex justify-between"><span className="text-gray-700">Response</span><span className="font-semibold text-gray-900">{fmtUs(latestPerf.quantiles.responseTimeP50)}</span></div>
-              </div>
-            </div>
-            <div className="bg-white rounded-xl border border-gray-200 p-4">
-              <p className="text-xs font-bold uppercase tracking-wide text-gray-500 mb-2">Daily Trend</p>
-              <div className="flex items-end gap-1 h-16">
-                {rumPerfDays.map((d, i) => (
-                  <div key={i} className="flex-1 flex flex-col justify-end" title={`${d.dimensions.date}: ${fmtUs(d.quantiles.pageLoadTimeP50)}`}>
-                    {/* eslint-disable-next-line react/forbid-dom-props */}
-                    <div className="w-full bg-indigo-400 rounded-t-sm"
-                      style={{ height: `${(d.quantiles.pageLoadTimeP50 / Math.max(...rumPerfDays.map(x => x.quantiles.pageLoadTimeP50), 1)) * 100}%` }} />
-                  </div>
-                ))}
-              </div>
-              <p className="text-xs text-gray-600 mt-1">Page load p50</p>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Core Web Vitals */}
-      {hasVitals && latestVitals && (
-        <div>
-          <p className="text-xs font-semibold text-gray-700 uppercase tracking-wider mb-3">Core Web Vitals</p>
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-            <VitalCard name="LCP" metric="lcp"
-              p50={latestVitals.quantiles.largestContentfulPaintP50}
-              p75={latestVitals.quantiles.largestContentfulPaintP75}
-              p90={latestVitals.quantiles.largestContentfulPaintP90} />
-            <VitalCard name="FCP" metric="fcp"
-              p50={latestVitals.quantiles.firstContentfulPaintP50}
-              p75={latestVitals.quantiles.firstContentfulPaintP75}
-              p90={latestVitals.quantiles.firstContentfulPaintP90} />
-            <VitalCard name="TTFB" metric="ttfb"
-              p50={latestVitals.quantiles.timeToFirstByteP50}
-              p75={latestVitals.quantiles.timeToFirstByteP75}
-              p90={latestVitals.quantiles.timeToFirstByteP90} />
-            <VitalCard name="INP" metric="inp"
-              p50={latestVitals.quantiles.interactionToNextPaintP50}
-              p75={latestVitals.quantiles.interactionToNextPaintP75}
-              p90={latestVitals.quantiles.interactionToNextPaintP90} />
-            <VitalCard name="FID" metric="fid"
-              p50={latestVitals.quantiles.firstInputDelayP50}
-              p75={latestVitals.quantiles.firstInputDelayP75}
-              p90={latestVitals.quantiles.firstInputDelayP90} />
-            <VitalCard name="CLS" metric="cls" isCls
-              p50={latestVitals.quantiles.cumulativeLayoutShiftP50}
-              p75={latestVitals.quantiles.cumulativeLayoutShiftP75}
-              p90={latestVitals.quantiles.cumulativeLayoutShiftP90} />
-          </div>
-        </div>
-      )}
-
-      {/* Daily Traffic */}
-      <Section title="Daily HTTP Traffic (7 days)">
-        {/* eslint-disable-next-line react/forbid-dom-props */}
-        <div className="flex items-end gap-2 mb-3" style={{ height: "60px" }}>
-          {days.map(d => (
-            <div key={d.dimensions.date} className="flex-1 flex flex-col justify-end"
-              title={`${d.dimensions.date}: ${fmtNum(d.sum.requests)} requests`}>
-              {/* eslint-disable-next-line react/forbid-dom-props */}
-              <div className="w-full bg-blue-500 rounded-t-sm" style={{ height: `${(d.sum.requests / maxReq) * 100}%` }} />
-            </div>
-          ))}
-        </div>
-        <div className="flex gap-2 mb-4">
-          {days.map(d => <div key={d.dimensions.date} className="flex-1 text-center text-xs text-gray-600 font-medium">{d.dimensions.date.slice(5)}</div>)}
-        </div>
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-              {["Date","Requests","Page Views","Unique*","Bandwidth","Cache%","HTTPS%","Threats"].map(h => (
-                <th key={h} className={`pb-2 ${h === "Date" ? "text-left" : "text-right"}`}>{h}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {days.map(d => (
-              <tr key={d.dimensions.date} className="border-b border-gray-50 hover:bg-gray-50">
-                <td className="py-2 text-gray-800">{d.dimensions.date}</td>
-                <td className="py-2 text-right font-medium">{fmtNum(d.sum.requests)}</td>
-                <td className="py-2 text-right text-gray-800">{fmtNum(d.sum.pageViews)}</td>
-                <td className="py-2 text-right text-gray-800">{fmtNum(d.uniq.uniques)}</td>
-                <td className="py-2 text-right text-gray-800">{fmtBytes(d.sum.bytes)}</td>
-                <td className="py-2 text-right text-gray-800">{pct(d.sum.cachedRequests, d.sum.requests)}</td>
-                <td className="py-2 text-right text-gray-800">{pct(d.sum.encryptedRequests, d.sum.requests)}</td>
-                <td className="py-2 text-right">{d.sum.threats > 0
-                  ? <span className="text-red-500 font-medium">{d.sum.threats}</span>
-                  : <span className="text-gray-500">—</span>}
-                </td>
-              </tr>
+          <div className="lg:col-span-2 px-5 py-5 border-t lg:border-t-0 lg:border-l border-[#1a1a1a] space-y-3">
+            {topMapCountries.map((c, i) => (
+              <CountryRow key={i} code={c.code} pct={c.pct} maxPct={maxCountryPct} color="#818cf8" />
             ))}
-          </tbody>
-        </table>
-      </Section>
+          </div>
+        </div>
+      </Card>
 
-      {/* RUM Daily Visits */}
-      {hasRUM && (
-        <Section title="Daily Visits (Web Analytics — Real Users)">
-          <table className="w-full text-sm">
+      {/* Daily Breakdown */}
+      <Card>
+        <CardHeader title="Daily Breakdown" sub="7 days" />
+        <div className="px-5 pt-4 pb-5">
+          <table className="w-full">
             <thead>
-              <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                {["Date","Visits (sessions)","Page Views","Avg Pages/Visit"].map(h => (
-                  <th key={h} className={`pb-2 ${h === "Date" ? "text-left" : "text-right"}`}>{h}</th>
-                ))}
+              <tr className="border-b border-[#222]">
+                <Th>Date</Th>
+                <Th right>Requests</Th>
+                {hasRUM && <Th right>Unique Visits</Th>}
+                {hasRUM && <Th right>Pages / Visit</Th>}
               </tr>
             </thead>
             <tbody>
-              {rumDays.map(d => (
-                <tr key={d.dimensions.date} className="border-b border-gray-50 hover:bg-gray-50">
-                  <td className="py-2 text-gray-800">{d.dimensions.date}</td>
-                  <td className="py-2 text-right font-medium">{fmtNum(d.sum.visits)}</td>
-                  <td className="py-2 text-right text-gray-800">{fmtNum(d.count)}</td>
-                  <td className="py-2 text-right text-gray-700">
-                    {d.sum.visits > 0 ? (d.count / d.sum.visits).toFixed(1) : "—"}
-                  </td>
+              {days.map((d, i) => (
+                <tr key={d.dimensions.date} className="hover:bg-white/[0.02] transition-colors">
+                  <Td><span className="text-white/65">{d.dimensions.date}</span></Td>
+                  <Td right><span className="font-semibold tabular-nums text-white/85">{fmtNum(d.sum.requests)}</span></Td>
+                  {hasRUM && (
+                    <Td right>
+                      <span className="tabular-nums text-white/65">{rumDays[i] ? fmtNum(rumDays[i].sum.visits) : "—"}</span>
+                    </Td>
+                  )}
+                  {hasRUM && (
+                    <Td right>
+                      <span className="tabular-nums text-white/65">
+                        {rumDays[i] && rumDays[i].sum.visits > 0 ? (rumDays[i].count / rumDays[i].sum.visits).toFixed(2) : "—"}
+                      </span>
+                    </Td>
+                  )}
                 </tr>
               ))}
             </tbody>
           </table>
-        </Section>
-      )}
+        </div>
+      </Card>
 
-      {/* Countries */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <Section title="Top Countries (HTTP requests)">
-          <div className="overflow-auto max-h-80">
-            <table className="w-full text-sm">
+      {/* Top Referrers */}
+      {hasRUM && rumReferers.length > 0 && (
+        <Card>
+          <CardHeader title="Top Referrers" sub="RUM · visit %" />
+          <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "320px" }}>
+            <table className="w-full">
               <thead>
-                <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                  <th className="text-left pb-2">Country</th>
-                  <th className="text-right pb-2">Requests</th>
-                  <th className="text-right pb-2">Bandwidth</th>
-                  <th className="text-right pb-2">Threats</th>
+                <tr className="border-b border-[#222]">
+                  <Th>Referrer</Th>
+                  <Th right>%</Th>
                 </tr>
               </thead>
               <tbody>
-                {countries.slice(0, 20).map(c => (
-                  <tr key={c.name} className="border-b border-gray-50 hover:bg-gray-50">
-                    <td className="py-1.5"><span className="mr-2">{flag(c.name)}</span><span className="text-gray-700">{c.name}</span></td>
-                    <td className="py-1.5 text-right">{fmtNum(c.requests)}</td>
-                    <td className="py-1.5 text-right text-gray-700">{fmtBytes(c.bytes)}</td>
-                    <td className="py-1.5 text-right">{c.threats > 0 ? <span className="text-red-500">{c.threats}</span> : <span className="text-gray-500">—</span>}</td>
-                  </tr>
-                ))}
+                {rumReferers.map((r, i) => {
+                  const p = totalRefVisits > 0 ? (r.sum.visits / totalRefVisits) * 100 : 0
+                  const maxP = totalRefVisits > 0 ? (rumReferers[0].sum.visits / totalRefVisits) * 100 : 1
+                  return (
+                    <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                      <Td><span className="text-white/70">{r.dimensions.refererHost || "(direct)"}</span></Td>
+                      <Td right>
+                        <div className="flex items-center justify-end gap-2.5">
+                          <div className="w-16 h-[3px] bg-[#1a1a1a] rounded-full overflow-hidden">
+                            <div className="h-full rounded-full bg-[#34d399]" style={{ width: `${(p / maxP) * 100}%` }} />
+                          </div>
+                          <span className="text-sm font-semibold text-white/75 tabular-nums w-12 text-right">{p.toFixed(1)}%</span>
+                        </div>
+                      </Td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
-        </Section>
+        </Card>
+      )}
 
-        {hasRUM ? (
-          <Section title="Top Countries (Real Visits — RUM)">
-            <div className="overflow-auto max-h-80">
-              {rumCountries.map((c, i) => (
-                <div key={i} className="flex items-center gap-3 py-1.5 border-b border-gray-50 last:border-0">
-                  <span>{flag(c.dimensions.countryName)}</span>
-                  <span className="flex-1 text-sm text-gray-900">{c.dimensions.countryName || "Unknown"}</span>
-                  <span className="font-medium text-sm">{fmtNum(c.sum.visits)}</span>
-                  <span className="text-xs text-gray-600">visits</span>
-                  <span className="text-xs text-gray-600">/ {fmtNum(c.count)} views</span>
-                </div>
-              ))}
-            </div>
-          </Section>
-        ) : (
-          <Section title="Top Paths (HTTP — today)">
-            <table className="w-full text-sm">
-              <thead><tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                <th className="text-left pb-2">Path</th><th className="text-right pb-2">Method</th><th className="text-right pb-2">Requests</th>
-              </tr></thead>
-              <tbody>
-                {topPaths.map((p, i) => (
-                  <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                    <td className="py-1.5 font-mono text-xs text-gray-900 truncate max-w-xs" title={p.dimensions.clientRequestPath}>{p.dimensions.clientRequestPath || "/"}</td>
-                    <td className="py-1.5 text-right"><span className="text-xs bg-gray-100 text-gray-800 px-1.5 py-0.5 rounded font-medium">{p.dimensions.clientRequestHTTPMethodName}</span></td>
-                    <td className="py-1.5 text-right font-medium">{fmtNum(p.count)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </Section>
-        )}
-      </div>
-
-      {/* RUM: Pages + Referers */}
-      {hasRUM && (
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          <Section title="Top Pages (Real Visits — RUM)">
-            <table className="w-full text-sm">
-              <thead><tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                <th className="text-left pb-2">Path</th><th className="text-right pb-2">Visits</th><th className="text-right pb-2">Views</th>
-              </tr></thead>
-              <tbody>
-                {rumPaths.map((p, i) => (
-                  <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                    <td className="py-1.5 font-mono text-xs text-gray-900 truncate max-w-xs" title={p.dimensions.requestPath}>{p.dimensions.requestPath || "/"}</td>
-                    <td className="py-1.5 text-right font-medium">{fmtNum(p.sum.visits)}</td>
-                    <td className="py-1.5 text-right text-gray-700">{fmtNum(p.count)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </Section>
-
-          <Section title="Top Referers (Real Visits — RUM)">
-            <table className="w-full text-sm">
-              <thead><tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                <th className="text-left pb-2">Referer Domain</th><th className="text-right pb-2">Visits</th>
-              </tr></thead>
-              <tbody>
-                {rumReferers.map((r, i) => (
-                  <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                    <td className="py-1.5 text-sm text-gray-900">{r.dimensions.refererHost || "(direct / none)"}</td>
-                    <td className="py-1.5 text-right font-medium">{fmtNum(r.sum.visits)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </Section>
+      {/* User Profile Donuts */}
+      {(devicesData.length > 0 || browsersData.length > 0 || osData.length > 0) && (
+        <div>
+          <p className="text-xs font-medium text-white/40 uppercase tracking-[0.1em] mb-4">User Profile</p>
+          <DonutChartsRow devices={devicesData} browsers={browsersData} os={osData} />
         </div>
       )}
 
-      {/* RUM: Browsers + Devices + OS */}
-      {hasRUM && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <Section title="Browsers (Real Visits)">
-            {rumBrowsers.map((b, i) => (
-              <Bar key={i} label={b.dimensions.userAgentBrowser} value={b.sum.visits}
-                max={rumBrowsers[0]?.sum.visits ?? 1} color="bg-purple-500" />
-            ))}
-          </Section>
-          <Section title="Devices (Real Visits)">
-            {rumDevices.map((d, i) => (
-              <Bar key={i} label={d.dimensions.deviceType} value={d.sum.visits}
-                max={rumDevices[0]?.sum.visits ?? 1} color="bg-orange-500" />
-            ))}
-          </Section>
-          <Section title="Operating Systems (Real Visits)">
-            {rumOS.map((o, i) => (
-              <Bar key={i} label={o.dimensions.userAgentOS} value={o.sum.visits}
-                max={rumOS[0]?.sum.visits ?? 1} color="bg-cyan-500" />
-            ))}
-          </Section>
-        </div>
+      {errors.length > 0 && (
+        <details className="text-xs">
+          <summary className="cursor-pointer text-amber-400 hover:text-amber-300 transition-colors">
+            ⚠ {errors.length} API error(s) — click to expand
+          </summary>
+          <pre className="mt-2 bg-[#111] border border-[#222] text-red-400 p-3 rounded-lg text-xs overflow-auto thin-scroll max-h-40">
+            {JSON.stringify(errors, null, 2)}
+          </pre>
+        </details>
       )}
-
-      {/* HTTP: Status Codes + Browsers + Content Types */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <Section title="HTTP Status Codes">
-          {statuses.map(s => (
-            <div key={s.key} className="flex items-center gap-3 mb-2.5 last:mb-0">
-              <span className={`text-xs font-mono px-2 py-0.5 rounded-full font-semibold ring-1 ${statusBadge(Number(s.key))}`}>{s.key}</span>
-              <div className="flex-1 h-1.5 bg-gray-100 rounded-full">
-                {/* eslint-disable-next-line react/forbid-dom-props */}
-                <div className={`h-full ${statusBg(Number(s.key))} rounded-full`}
-                  style={{ width: `${H.requests > 0 ? (s.value / H.requests) * 100 : 0}%` }} />
-              </div>
-              <span className="text-xs text-gray-700 w-14 text-right">{fmtNum(s.value)}</span>
-            </div>
-          ))}
-        </Section>
-        <Section title="Browsers (HTTP layer)">
-          {browsers.slice(0, 10).map(b => (
-            <Bar key={b.key} label={b.key || "Unknown"} value={b.value} max={browsers[0]?.value ?? 1} color="bg-violet-500" />
-          ))}
-        </Section>
-        <Section title="Content Types">
-          {content.slice(0, 10).map(c => (
-            <Bar key={c.key} label={c.key || "other"} value={c.value} max={content[0]?.value ?? 1} color="bg-teal-500" />
-          ))}
-        </Section>
-      </div>
-
-      {/* Protocol / SSL / Devices / IP */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
-        <Section title="HTTP Version">
-          {httpVer.map(h => <Bar key={h.key} label={h.key} value={h.value} max={H.requests} note={pct(h.value, H.requests)} color="bg-indigo-500" />)}
-        </Section>
-        <Section title="TLS Protocols">
-          {ssl.map(s => <Bar key={s.key} label={s.key || "None"} value={s.value} max={H.requests} note={pct(s.value, H.requests)} color="bg-green-500" />)}
-        </Section>
-        <Section title="Devices (HTTP today)">
-          {topDevices.length === 0
-            ? <p className="text-sm text-gray-400">No data today.</p>
-            : topDevices.map((d, i) => (
-              <Bar key={i} label={d.dimensions.clientDeviceType || "Unknown"}
-                value={d.count} max={topDevices[0]?.count ?? 1} color="bg-orange-500" />
-            ))}
-        </Section>
-        <Section title="Traffic Source (IP Class)">
-          {ipClass.map(c => <Bar key={c.key} label={c.key} value={c.value} max={H.requests} note={pct(c.value, H.requests)} color="bg-gray-500" />)}
-        </Section>
-      </div>
-
-      {/* HTTP Top Paths */}
-      <Section title="Top Paths — HTTP (today)">
-        {topPaths.length === 0
-          ? <p className="text-sm text-gray-400">No data for today yet.</p>
-          : (
-            <table className="w-full text-sm">
-              <thead><tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                <th className="text-left pb-2">Path</th><th className="text-right pb-2">Method</th><th className="text-right pb-2">Requests</th>
-              </tr></thead>
-              <tbody>
-                {topPaths.map((p, i) => (
-                  <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                    <td className="py-1.5 font-mono text-xs text-gray-900 truncate max-w-xl" title={p.dimensions.clientRequestPath}>{p.dimensions.clientRequestPath || "/"}</td>
-                    <td className="py-1.5 text-right"><span className="text-xs bg-gray-100 text-gray-800 px-1.5 py-0.5 rounded font-medium">{p.dimensions.clientRequestHTTPMethodName}</span></td>
-                    <td className="py-1.5 text-right font-medium">{fmtNum(p.count)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-      </Section>
-    </div>
+    </section>
   )
 }
 
-// ─── Search Console Section ───────────────────────────────────────────────────
+// ─── Section 2: Google Search Console ────────────────────────────────────────
 
 async function SearchConsoleSection() {
   const sc = await cachedSC()
 
   return (
-    <div className="border-t-2 border-gray-300 pt-8">
-      <div className="flex items-center gap-3 mb-6">
-        <div className="w-6 h-6 rounded-full bg-blue-600 flex items-center justify-center">
-          <span className="text-white text-xs font-bold">G</span>
-        </div>
-        <h2 className="text-lg font-bold text-gray-900">Google Search Console</h2>
-        {sc && <span className="text-xs text-gray-600 bg-gray-100 px-2 py-0.5 rounded">{sc.startDate} → {sc.endDate} (28 days)</span>}
-      </div>
+    <section className="space-y-5">
+      <SectionHeader number="02" title="Google Search Performance" />
 
       {!sc && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
-          Search Console env vars not set. Add <code className="bg-red-100 px-1 rounded">GOOGLE_SITE_URL</code> to .env
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-400">
+          Search Console not configured. Add <code className="bg-red-500/20 px-1 rounded">GOOGLE_SITE_URL</code> to .env
         </div>
       )}
-
       {sc && !sc.ok && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-400">
           <strong>Error:</strong> {sc.error}
         </div>
       )}
 
       {sc?.ok && (() => {
-        const noData = (d: import("@/lib/search-console").SCTypeData) => d.totalClicks === 0 && d.totalImpressions === 0
+        const web   = sc.web
+        const image = sc.image
 
-        const PerfSection = ({ data, title, sub }: { data: import("@/lib/search-console").SCTypeData; title: string; sub: string }) => (
-          <Section title={title} sub={sub}>
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
-              {[
-                { label: "Total Clicks",      main: fmtNum(data.totalClicks),      sub2: `${fmtNum(data.clicks7d)} last 7d` },
-                { label: "Total Impressions", main: fmtNum(data.totalImpressions), sub2: `${fmtNum(data.impressions7d)} last 7d` },
-                { label: "Avg CTR",           main: data.totalImpressions > 0 ? (data.avgCtr * 100).toFixed(2) + "%" : "—", sub2: "click-through rate" },
-                { label: "Avg Position",      main: data.avgPosition > 0 ? data.avgPosition.toFixed(1) : "—", sub2: data.avgPosition > 0 && data.avgPosition <= 10 ? "Top 10 ✓" : data.avgPosition > 0 ? `Position ${Math.round(data.avgPosition)}` : "no data", color: data.avgPosition > 0 && data.avgPosition <= 10 ? "text-green-600" : data.avgPosition > 0 ? "text-amber-600" : "text-gray-900" },
-              ].map(c => (
-                <div key={c.label} className="bg-white rounded-xl border border-gray-200 p-4">
-                  <p className="text-xs text-gray-600 uppercase font-semibold tracking-wide mb-1">{c.label}</p>
-                  <p className={`text-2xl font-semibold ${"color" in c ? c.color : "text-gray-900"}`}>{c.main}</p>
-                  <p className="text-xs text-gray-500 mt-0.5">{c.sub2}</p>
-                </div>
-              ))}
+        const chartData = web.byDate.map(r => ({
+          date:        r.keys[0],
+          clicks:      r.clicks,
+          impressions: Math.round(r.impressions / 10),
+        }))
+
+        const byDate  = web.byDate
+        const recent7 = byDate.slice(-7)
+        const prev7   = byDate.slice(-14, -7)
+
+        const r7c   = recent7.reduce((s, r) => s + r.clicks, 0)
+        const p7c   = prev7.reduce((s, r) => s + r.clicks, 0)
+        const r7i   = recent7.reduce((s, r) => s + r.impressions, 0)
+        const p7i   = prev7.reduce((s, r) => s + r.impressions, 0)
+        const r7pos = recent7.length ? recent7.reduce((s, r) => s + r.position, 0) / recent7.length : 0
+        const p7pos = prev7.length   ? prev7.reduce((s, r) => s + r.position, 0)  / prev7.length   : 0
+        const r7ctr = recent7.length ? recent7.reduce((s, r) => s + r.ctr, 0) / recent7.length : 0
+        const p7ctr = prev7.length   ? prev7.reduce((s, r) => s + r.ctr, 0)   / prev7.length   : 0
+
+        const clickSpark = byDate.slice(-7).map(r => r.clicks)
+        const imprSpark  = byDate.slice(-7).map(r => r.impressions)
+        const posSpark   = byDate.slice(-7).map(r => r.position)
+        const ctrSpark   = byDate.slice(-7).map(r => r.ctr * 100)
+
+        // SC country map — convert alpha-3 ("ind") → alpha-2 ("IN") for WorldMap
+        const totalSCClicks   = web.byCountry.reduce((s, r) => s + r.clicks, 0)
+        const scCountryMapData = web.byCountry
+          .map(r => ({
+            code:   SC_A3_TO_A2[r.keys[0].toLowerCase()] ?? r.keys[0].toUpperCase().slice(0, 2),
+            visits: r.clicks,
+            pct:    totalSCClicks > 0 ? (r.clicks / totalSCClicks) * 100 : 0,
+          }))
+          .filter(c => c.code.length === 2)
+        const topSCCountries = scCountryMapData.slice(0, 8)
+        const maxSCPct       = topSCCountries[0]?.pct ?? 1
+
+        // Device donut
+        const deviceDonutData = web.byDevice.map(r => ({
+          name:  r.keys[0].charAt(0).toUpperCase() + r.keys[0].slice(1).toLowerCase(),
+          value: r.clicks,
+        }))
+
+        return (
+          <div className="space-y-5">
+            {/* Stat Cards */}
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+              <SparklineCard label="Avg Position"
+                value={web.avgPosition > 0 ? web.avgPosition.toFixed(1) : "—"}
+                change={p7pos > 0 ? -((r7pos - p7pos) / p7pos) * 100 : undefined}
+                data={posSpark.map(v => 100 - v)} color="#a78bfa" gradientId="grad-pos"
+                sub="28 days · lower = better" />
+              <SparklineCard label="Total Clicks" value={fmtNum(web.totalClicks)}
+                change={p7c > 0 ? ((r7c - p7c) / p7c) * 100 : undefined}
+                data={clickSpark} color="#60a5fa" gradientId="grad-clicks" sub="28 days" />
+              <SparklineCard label="Total Impressions" value={fmtNum(web.totalImpressions)}
+                change={p7i > 0 ? ((r7i - p7i) / p7i) * 100 : undefined}
+                data={imprSpark} color="#34d399" gradientId="grad-impr" sub="28 days" />
+              <SparklineCard label="Avg CTR"
+                value={web.totalImpressions > 0 ? (web.avgCtr * 100).toFixed(2) + "%" : "—"}
+                change={p7ctr > 0 ? ((r7ctr - p7ctr) / p7ctr) * 100 : undefined}
+                data={ctrSpark} color="#fbbf24" gradientId="grad-ctr" sub="click-through rate" />
             </div>
 
-            {data.byDate.length > 0 && (() => {
-              const maxC = Math.max(...data.byDate.map(r => r.clicks), 1)
-              const maxI = Math.max(...data.byDate.map(r => r.impressions), 1)
-              return (
-                <div className="mb-5">
-                  <div className="flex items-end gap-1 mb-1" style={{ height: "56px" }}>
-                    {data.byDate.map((r, i) => (
-                      <div key={i} className="flex-1 flex flex-col justify-end gap-px"
-                        title={`${r.keys[0]}: ${r.clicks} clicks, ${r.impressions} impressions`}>
-                        {/* eslint-disable-next-line react/forbid-dom-props */}
-                        <div className="w-full bg-purple-300 rounded-t-sm" style={{ height: `${(r.impressions / maxI) * 40}%` }} />
-                        {/* eslint-disable-next-line react/forbid-dom-props */}
-                        <div className="w-full bg-blue-600 rounded-t-sm" style={{ height: `${(r.clicks / maxC) * 60}%` }} />
+            {/* Chart + Search Queries */}
+            {chartData.length > 0 && (
+              <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
+                <Card className="lg:col-span-2">
+                  <CardHeader title="Clicks & Impressions" sub="28 days" />
+                  <div className="p-5 h-56">
+                    <SCChart data={chartData} />
+                  </div>
+                  <div className="px-5 pb-4">
+                    <p className="text-xs text-white/30">* Impressions scaled ÷10 for chart legibility</p>
+                  </div>
+                </Card>
+
+                <Card className="lg:col-span-3">
+                  <CardHeader title="Search Queries" sub="Top 25 · 28 days" />
+                  <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "320px" }}>
+                    <table className="w-full">
+                      <thead>
+                        <tr className="border-b border-[#222]">
+                          <Th>Query</Th>
+                          <Th right>Pos.</Th>
+                          <Th right>Clicks</Th>
+                          <Th right>Impr.</Th>
+                          <Th right>CTR</Th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {web.topQueries.map((r, i) => (
+                          <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                            <Td>
+                              <span className="truncate block max-w-[200px] text-white/70" title={r.keys[0]}>{r.keys[0]}</span>
+                            </Td>
+                            <Td right><PositionBadge pos={r.position} /></Td>
+                            <Td right><span className="font-semibold tabular-nums text-white/85">{fmtNum(r.clicks)}</span></Td>
+                            <Td right><span className="text-white/50 tabular-nums">{fmtNum(r.impressions)}</span></Td>
+                            <Td right><span className="text-white/50 tabular-nums">{(r.ctr * 100).toFixed(1)}%</span></Td>
+                          </tr>
+                        ))}
+                        {web.topQueries.length === 0 && (
+                          <tr><Td><span className="text-white/35">No query data yet</span></Td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                </Card>
+              </div>
+            )}
+
+            {/* Country Map */}
+            <Card>
+              <CardHeader title="Clicks by Country" sub="Google Search · 28 days" />
+              <div className="grid grid-cols-1 lg:grid-cols-5">
+                <div className="lg:col-span-3 p-4" style={{ height: "460px" }}>
+                  <WorldMap countries={scCountryMapData} accentColor="#a78bfa" />
+                </div>
+                <div className="lg:col-span-2 px-5 py-5 border-t lg:border-t-0 lg:border-l border-[#1a1a1a] space-y-3">
+                  {topSCCountries.length === 0 && (
+                    <p className="text-sm text-white/35">No country data yet</p>
+                  )}
+                  {topSCCountries.map((c, i) => (
+                    <CountryRow key={i} code={c.code} pct={c.pct} maxPct={maxSCPct} color="#a78bfa" />
+                  ))}
+                </div>
+              </div>
+            </Card>
+
+            {/* Image Search + Device side by side */}
+            {image.totalImpressions > 0 && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
+                {/* Image Search Performance — colorful stat cards */}
+                <Card className="lg:col-span-2">
+                  <CardHeader title="Image Search Performance" sub="28 days" />
+                  <div className="p-5 grid grid-cols-3 gap-3 mb-1">
+                    {[
+                      { label: "Avg Position",  value: image.avgPosition > 0 ? image.avgPosition.toFixed(1) : "—", color: "#a78bfa" },
+                      { label: "Impressions",   value: fmtNum(image.totalImpressions),                               color: "#34d399" },
+                      { label: "CTR",           value: image.totalImpressions > 0 ? (image.avgCtr * 100).toFixed(2) + "%" : "—", color: "#fbbf24" },
+                    ].map(s => (
+                      <div key={s.label} className="rounded-lg border border-[#222] bg-[#0d0d0d] p-4">
+                        <p className="text-xs text-white/40 mb-2 uppercase tracking-wider">{s.label}</p>
+                        <p className="text-2xl font-bold tabular-nums text-white">{s.value}</p>
                       </div>
                     ))}
                   </div>
-                  <div className="flex gap-4 text-xs text-gray-600 mb-3">
-                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-blue-600 inline-block" /> Clicks</span>
-                    <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-purple-300 inline-block" /> Impressions</span>
-                    <span className="ml-auto">{data.byDate[0]?.keys[0]} → {data.byDate[data.byDate.length-1]?.keys[0]}</span>
-                  </div>
-                </div>
-              )
-            })()}
-
-            {(data.topQueries.length > 0 || data.topPages.length > 0) && (
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5 mb-5">
-                {data.topQueries.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">Top Queries</p>
-                    <table className="w-full text-sm">
-                      <thead><tr className="text-xs text-gray-600 font-semibold border-b border-gray-200">
-                        <th className="text-left pb-1.5">Query</th>
-                        <th className="text-right pb-1.5">Clicks</th>
-                        <th className="text-right pb-1.5">Impr.</th>
-                        <th className="text-right pb-1.5">CTR</th>
-                        <th className="text-right pb-1.5">Pos.</th>
-                      </tr></thead>
+                  <CardHeader title="Image Search Queries" />
+                  <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "240px" }}>
+                    <table className="w-full">
+                      <thead>
+                        <tr className="border-b border-[#222]">
+                          <Th>Query</Th>
+                          <Th right>Pos.</Th>
+                          <Th right>Impr.</Th>
+                          <Th right>CTR</Th>
+                        </tr>
+                      </thead>
                       <tbody>
-                        {data.topQueries.map((r, i) => (
-                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                            <td className="py-1.5 text-gray-900 max-w-[180px] truncate font-medium" title={r.keys[0]}>{r.keys[0]}</td>
-                            <td className="py-1.5 text-right font-semibold text-gray-900">{fmtNum(r.clicks)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{fmtNum(r.impressions)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{(r.ctr*100).toFixed(1)}%</td>
-                            <td className="py-1.5 text-right font-semibold">
-                              <span className={r.position<=3?"text-green-700":r.position<=10?"text-green-600":r.position<=20?"text-amber-600":"text-gray-700"}>{r.position.toFixed(1)}</span>
-                            </td>
+                        {image.topQueries.map((r, i) => (
+                          <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                            <Td><span className="truncate block max-w-[180px] text-white/70" title={r.keys[0]}>{r.keys[0]}</span></Td>
+                            <Td right><PositionBadge pos={r.position} /></Td>
+                            <Td right><span className="text-white/50 tabular-nums">{fmtNum(r.impressions)}</span></Td>
+                            <Td right><span className="text-white/50 tabular-nums">{(r.ctr * 100).toFixed(1)}%</span></Td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
-                )}
-                {data.topPages.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">Top Pages</p>
-                    <table className="w-full text-sm">
-                      <thead><tr className="text-xs text-gray-600 font-semibold border-b border-gray-200">
-                        <th className="text-left pb-1.5">Page</th>
-                        <th className="text-right pb-1.5">Clicks</th>
-                        <th className="text-right pb-1.5">Impr.</th>
-                        <th className="text-right pb-1.5">CTR</th>
-                        <th className="text-right pb-1.5">Pos.</th>
-                      </tr></thead>
-                      <tbody>
-                        {data.topPages.map((r, i) => (
-                          <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                            <td className="py-1.5 font-mono text-xs text-gray-900 max-w-[180px] truncate" title={r.keys[0]}>{r.keys[0].replace(/^https?:\/\/[^/]+/,"") || "/"}</td>
-                            <td className="py-1.5 text-right font-semibold text-gray-900">{fmtNum(r.clicks)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{fmtNum(r.impressions)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{(r.ctr*100).toFixed(1)}%</td>
-                            <td className="py-1.5 text-right font-semibold">
-                              <span className={r.position<=3?"text-green-700":r.position<=10?"text-green-600":r.position<=20?"text-amber-600":"text-gray-700"}>{r.position.toFixed(1)}</span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
+                </Card>
+
+                {/* Device Donut */}
+                {deviceDonutData.length > 0 && (
+                  <DonutChart data={deviceDonutData} title="Device Breakdown" />
                 )}
               </div>
             )}
 
-            {(data.byCountry.length > 0 || data.byDevice.length > 0) && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-                {data.byCountry.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">Countries</p>
-                    {data.byCountry.slice(0,10).map((r,i) => (
-                      <Bar key={i} label={`${flag(r.keys[0])} ${r.keys[0]}`} value={r.clicks}
-                        max={data.byCountry[0]?.clicks??1}
-                        note={`${fmtNum(r.clicks)} clicks · pos ${r.position.toFixed(1)}`}
-                        color="bg-blue-600" />
-                    ))}
-                  </div>
-                )}
-                {data.byDevice.length > 0 && (
-                  <div>
-                    <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-2">Devices</p>
-                    <table className="w-full text-sm">
-                      <thead><tr className="text-xs text-gray-600 font-semibold border-b border-gray-200">
-                        <th className="text-left pb-1.5">Device</th>
-                        <th className="text-right pb-1.5">Clicks</th>
-                        <th className="text-right pb-1.5">Impr.</th>
-                        <th className="text-right pb-1.5">CTR</th>
-                        <th className="text-right pb-1.5">Pos.</th>
-                      </tr></thead>
-                      <tbody>
-                        {data.byDevice.map((r,i) => (
-                          <tr key={i} className="border-b border-gray-50">
-                            <td className="py-1.5 font-semibold text-gray-900 capitalize">{r.keys[0].toLowerCase()}</td>
-                            <td className="py-1.5 text-right font-semibold text-gray-900">{fmtNum(r.clicks)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{fmtNum(r.impressions)}</td>
-                            <td className="py-1.5 text-right text-gray-700">{(r.ctr*100).toFixed(1)}%</td>
-                            <td className="py-1.5 text-right font-semibold">
-                              <span className={r.position<=10?"text-green-600":r.position<=20?"text-amber-600":"text-gray-700"}>{r.position.toFixed(1)}</span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
+            {/* If no image search data, show device donut alone */}
+            {image.totalImpressions === 0 && deviceDonutData.length > 0 && (
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                <DonutChart data={deviceDonutData} title="Device Breakdown" />
               </div>
             )}
 
-            {noData(data) && (
-              <div className="text-center py-6 text-gray-500">
-                <p className="text-sm">No {title.toLowerCase()} data yet in this 28-day window.</p>
-                <p className="text-xs mt-1">Data appears once Google starts recording impressions for your pages.</p>
-              </div>
-            )}
-          </Section>
-        )
-
-        const verdictBadge = (v: string) => {
-          if (v === "PASS")    return "text-green-800 bg-green-100 border border-green-300"
-          if (v === "FAIL")    return "text-red-800 bg-red-100 border border-red-300"
-          if (v === "NEUTRAL") return "text-amber-800 bg-amber-100 border border-amber-300"
-          return "text-gray-700 bg-gray-100 border border-gray-200"
-        }
-
-        const firstSitemapPath = sc.sitemaps[0]?.path ?? ""
-
-        return (
-          <div className="space-y-6">
-            <PerfSection data={sc.web} title="Performance — Web Search" sub={`${sc.startDate} → ${sc.endDate} · 28 days`} />
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <PerfSection data={sc.image} title="Image Search" sub="28 days" />
-              <PerfSection data={sc.video} title="Video Search" sub="28 days" />
-              <PerfSection data={sc.news}  title="Google News"  sub="28 days" />
-            </div>
-
-            <Section title="Core Web Vitals (Field Data)" sub="Based on real Chrome user data · Experience tab">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {["Mobile","Desktop"].map(device => (
-                  <div key={device} className="bg-gray-50 border border-gray-200 rounded-xl p-5 text-center">
-                    <p className="text-sm font-semibold text-gray-800 mb-2">{device}</p>
-                    <p className="text-xs text-gray-600">Not enough usage data in the last 90 days.</p>
-                    <p className="text-xs text-gray-500 mt-1">
-                      Search Console needs ~100 real Chrome users before it reports CWV field data.
-                    </p>
-                  </div>
-                ))}
-              </div>
-            </Section>
-
-            {sc.sitemaps.length > 0 && (
-              <Section title="Sitemaps" sub="Indexing → Sitemaps">
-                <table className="w-full text-sm">
+            {/* Top Pages */}
+            <Card>
+              <CardHeader title="Top Pages" sub="Web search · 28 days" />
+              <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "340px" }}>
+                <table className="w-full">
                   <thead>
-                    <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                      <th className="text-left pb-2">Sitemap URL</th>
-                      <th className="text-right pb-2">Submitted URLs</th>
-                      <th className="text-right pb-2">Indexed</th>
-                      <th className="text-right pb-2">Warnings</th>
-                      <th className="text-right pb-2">Errors</th>
-                      <th className="text-right pb-2">Last Downloaded</th>
+                    <tr className="border-b border-[#222]">
+                      <Th>Page</Th>
+                      <Th right>Pos.</Th>
+                      <Th right>Clicks</Th>
+                      <Th right>CTR</Th>
                     </tr>
                   </thead>
                   <tbody>
-                    {sc.sitemaps.map((s, i) => (
-                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                        <td className="py-2 font-mono text-xs text-gray-900 max-w-xs truncate" title={s.path}>{s.path}</td>
-                        <td className="py-2 text-right text-gray-800 font-medium">{s.submitted}</td>
-                        <td className="py-2 text-right">
-                          <span className={s.indexed > 0 ? "text-green-700 font-semibold" : "text-amber-700 font-semibold"}>{s.indexed}</span>
-                        </td>
-                        <td className="py-2 text-right">{s.warnings > 0 ? <span className="text-amber-700 font-semibold">{s.warnings}</span> : <span className="text-gray-700">0</span>}</td>
-                        <td className="py-2 text-right">{s.errors > 0 ? <span className="text-red-700 font-semibold">{s.errors}</span> : <span className="text-gray-700">0</span>}</td>
-                        <td className="py-2 text-right text-gray-800">{s.lastDownloaded ? s.lastDownloaded.slice(0,10) : "—"}</td>
+                    {web.topPages.map((r, i) => (
+                      <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                        <Td mono>{r.keys[0].replace(/^https?:\/\/[^/]+/, "") || "/"}</Td>
+                        <Td right><PositionBadge pos={r.position} /></Td>
+                        <Td right><span className="font-semibold tabular-nums text-white/85">{fmtNum(r.clicks)}</span></Td>
+                        <Td right><span className="text-white/50 tabular-nums">{(r.ctr * 100).toFixed(1)}%</span></Td>
                       </tr>
                     ))}
+                    {web.topPages.length === 0 && (
+                      <tr><Td><span className="text-white/35">No page data yet</span></Td></tr>
+                    )}
                   </tbody>
                 </table>
-              </Section>
-            )}
-
-            {/* Page inspections load separately so they don't block the rest */}
-            {firstSitemapPath && (
-              <Suspense fallback={
-                <Section title="Indexing — Pages" sub="loading…">
-                  <TableSkel rows={8} />
-                </Section>
-              }>
-                <PageInspectionSection sitemapPath={firstSitemapPath} />
-              </Suspense>
-            )}
+              </div>
+            </Card>
           </div>
         )
       })()}
-    </div>
+    </section>
   )
 }
 
-// ─── Page Inspection Section (slow — streams in after SC analytics) ───────────
-
-async function PageInspectionSection({ sitemapPath }: { sitemapPath: string }) {
-  const inspections = await cachedPageInspections(sitemapPath)
-  if (inspections.length === 0) return null
-
-  const verdictBadge = (v: string) => {
-    if (v === "PASS")    return "text-green-800 bg-green-100 border border-green-300"
-    if (v === "FAIL")    return "text-red-800 bg-red-100 border border-red-300"
-    if (v === "NEUTRAL") return "text-amber-800 bg-amber-100 border border-amber-300"
-    return "text-gray-700 bg-gray-100 border border-gray-200"
-  }
-
-  const indexed    = inspections.filter(p => p.verdict === "PASS").length
-  const notIndexed = inspections.filter(p => p.verdict !== "PASS").length
-
-  return (
-    <Section title="Indexing — Pages" sub="Indexing → Pages · live URL Inspection per sitemap entry">
-      <div className="flex gap-3 mb-4">
-        <span className="text-sm font-semibold text-green-800 bg-green-100 border border-green-300 px-3 py-1 rounded-full">
-          {indexed} Indexed
-        </span>
-        {notIndexed > 0 && (
-          <span className="text-sm font-semibold text-amber-800 bg-amber-100 border border-amber-300 px-3 py-1 rounded-full">
-            {notIndexed} Not yet indexed
-          </span>
-        )}
-      </div>
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-            <th className="text-left pb-2">Page URL</th>
-            <th className="text-center pb-2">Status</th>
-            <th className="text-left pb-2">Coverage State</th>
-            <th className="text-right pb-2">Last Crawled</th>
-            <th className="text-center pb-2">Crawled As</th>
-            <th className="text-center pb-2">Mobile</th>
-          </tr>
-        </thead>
-        <tbody>
-          {inspections.map((p, i) => {
-            const pagePath = p.url.replace(/^https?:\/\/[^/]+/, "") || "/"
-            const mob    = p.mobileVerdict === "PASS" ? "✓" : p.mobileVerdict === "FAIL" ? "✗" : "—"
-            const mobCls = p.mobileVerdict === "PASS" ? "text-green-700 font-bold" : p.mobileVerdict === "FAIL" ? "text-red-700 font-bold" : "text-gray-500"
-            return (
-              <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                <td className="py-2 font-mono text-xs text-gray-900 max-w-[220px] truncate" title={p.url}>{pagePath}</td>
-                <td className="py-2 text-center">
-                  <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${verdictBadge(p.verdict)}`}>
-                    {p.verdict === "PASS" ? "Indexed" : p.verdict === "FAIL" ? "Error" : "Not indexed"}
-                  </span>
-                </td>
-                <td className="py-2 text-xs text-gray-800">{p.coverageState}</td>
-                <td className="py-2 text-right text-gray-800">{p.lastCrawlTime ? p.lastCrawlTime.slice(0,10) : <span className="text-gray-400">Never</span>}</td>
-                <td className="py-2 text-center text-xs text-gray-700 capitalize">{p.crawledAs?.toLowerCase() || "—"}</td>
-                <td className={`py-2 text-center text-sm ${mobCls}`}>{mob}</td>
-              </tr>
-            )
-          })}
-        </tbody>
-      </table>
-    </Section>
-  )
-}
-
-// ─── Bing Section ─────────────────────────────────────────────────────────────
+// ─── Section 3: Bing ──────────────────────────────────────────────────────────
 
 async function BingSection() {
   const bing = await cachedBing()
 
+  // Split 90d into current 30d and prior 30d for change %
+  const sorted   = bing ? [...bing.queryStats].sort((a, b) => a.date.localeCompare(b.date)) : []
+  const curr30   = sorted.slice(-30)
+  const prev30   = sorted.slice(-60, -30)
+
+  const currClicks = curr30.reduce((a, r) => a + r.clicks, 0)
+  const prevClicks = prev30.reduce((a, r) => a + r.clicks, 0)
+  const currImpr   = curr30.reduce((a, r) => a + r.impressions, 0)
+  const prevImpr   = prev30.reduce((a, r) => a + r.impressions, 0)
+
+  const currPos = curr30.filter(r => r.avgPosition > 0).length > 0
+    ? curr30.filter(r => r.avgPosition > 0).reduce((a, r) => a + r.avgPosition, 0) / curr30.filter(r => r.avgPosition > 0).length : 0
+  const prevPos = prev30.filter(r => r.avgPosition > 0).length > 0
+    ? prev30.filter(r => r.avgPosition > 0).reduce((a, r) => a + r.avgPosition, 0) / prev30.filter(r => r.avgPosition > 0).length : 0
+
+  const crawledPages = bing ? bing.pageInfo.filter(p => p.lastCrawled).length : 0
+
+  const clickChange  = changePct(currClicks, prevClicks)
+  const imprChange   = changePct(currImpr, prevImpr)
+  // Position: lower is better, so flip sign for badge
+  const posChange    = prevPos > 0 ? -changePct(currPos, prevPos) : 0
+
+  const clickSpark = curr30.map(r => r.clicks)
+  const imprSpark  = curr30.map(r => r.impressions)
+  const posSpark   = curr30.map(r => r.avgPosition)
+
   return (
-    <div className="border-t-2 border-gray-300 pt-8">
-      <div className="flex items-center gap-3 mb-6">
-        <div className="w-6 h-6 rounded-full bg-[#008373] flex items-center justify-center">
-          <span className="text-white text-xs font-bold">B</span>
-        </div>
-        <h2 className="text-lg font-bold text-gray-900">Bing Webmaster Tools</h2>
-        {bing && (
-          <span className="text-xs text-gray-600 bg-gray-100 px-2 py-0.5 rounded">
-            {bing.startDate} → {bing.endDate} · 90 days
-          </span>
-        )}
-      </div>
+    <section className="space-y-5">
+      <SectionHeader number="03" title="Bing Webmaster Tools" />
 
       {!bing && (
-        <div className="bg-red-50 border border-red-200 rounded-xl p-4 text-sm text-red-700">
-          Bing API key not set. Add <code className="bg-red-100 px-1 rounded">Bing_api</code> to .env
+        <div className="bg-red-500/10 border border-red-500/30 rounded-xl p-4 text-sm text-red-400">
+          Bing API key not set. Add <code className="bg-red-500/20 px-1 rounded">Bing_api</code> to .env
         </div>
       )}
 
-      {bing && (() => {
-        const totalClicks      = bing.queryStats.reduce((a, r) => a + r.clicks, 0)
-        const totalImpressions = bing.queryStats.reduce((a, r) => a + r.impressions, 0)
-        const avgPos           = bing.queryStats.length > 0
-          ? bing.queryStats.reduce((a, r) => a + r.avgPosition, 0) / bing.queryStats.length
-          : 0
+      {bing && (
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          <SparklineCard
+            label="Bing Clicks"
+            value={fmtNum(currClicks)}
+            change={prevClicks > 0 ? clickChange : undefined}
+            data={clickSpark}
+            color="#34d399"
+            gradientId="bing-clicks"
+            sub="organic clicks · 30d"
+          />
+          <SparklineCard
+            label="Bing Impressions"
+            value={fmtNum(currImpr)}
+            change={prevImpr > 0 ? imprChange : undefined}
+            data={imprSpark}
+            color="#818cf8"
+            gradientId="bing-impr"
+            sub="search impressions · 30d"
+          />
+          <SparklineCard
+            label="Avg Position"
+            value={currPos > 0 ? currPos.toFixed(1) : "—"}
+            change={prevPos > 0 ? posChange : undefined}
+            data={posSpark}
+            color="#fbbf24"
+            gradientId="bing-pos"
+            sub="avg rank on Bing"
+          />
+          <SparklineCard
+            label="Pages Crawled"
+            value={`${crawledPages} / ${bing.pageInfo.length}`}
+            data={[]}
+            color="#60a5fa"
+            gradientId="bing-crawl"
+            sub="From sitemap"
+          />
+        </div>
+      )}
 
-        const crawledPages = bing.pageInfo.filter(p => p.lastCrawled).length
-        const largeSizeThreshold = 500 * 1024
-
-        const sizeColor = (bytes: number) =>
-          bytes >= 1_000_000 ? "text-red-700 font-semibold" :
-          bytes >= largeSizeThreshold ? "text-amber-700 font-semibold" : "text-gray-800"
-
-        return (
-          <div className="space-y-6">
-            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-              <StatCard label="Bing Clicks (90d)"      value={fmtNum(totalClicks)}
-                sub={totalClicks === 0 ? "No Bing traffic yet" : undefined} />
-              <StatCard label="Bing Impressions (90d)" value={fmtNum(totalImpressions)}
-                sub={totalImpressions === 0 ? "No impressions yet" : undefined} />
-              <StatCard label="Avg Position (Bing)"    value={avgPos > 0 ? avgPos.toFixed(1) : "—"}
-                sub="When Bing shows your site" />
-              <StatCard label="Pages Crawled by Bing"  value={`${crawledPages} / ${bing.pageInfo.length}`}
-                sub="From sitemap" color={crawledPages === bing.pageInfo.length ? "text-green-700" : "text-amber-700"} />
-            </div>
-
-            {bing.pageInfo.length > 0 && (
-              <Section title="Bing Crawl Status" sub="Per-page — discovery date, last crawl, document size, inbound anchor links">
-                <div className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-4">
-                  Pages highlighted in red are very large (&gt;1 MB) and may be slow to crawl. Amber pages are &gt;500 KB.
-                </div>
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                      <th className="text-left pb-2">Page</th>
-                      <th className="text-right pb-2">Discovered</th>
-                      <th className="text-right pb-2">Last Crawled</th>
-                      <th className="text-right pb-2">Doc Size</th>
-                      <th className="text-right pb-2">Inbound Links</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bing.pageInfo.map((p, i) => (
-                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                        <td className="py-2 font-mono text-xs text-gray-900 max-w-[240px] truncate" title={p.url}>{p.path}</td>
-                        <td className="py-2 text-right text-gray-700">{p.discoveryDate || <span className="text-gray-400">—</span>}</td>
-                        <td className="py-2 text-right">
-                          {p.lastCrawled
-                            ? <span className="text-gray-800">{p.lastCrawled}</span>
-                            : <span className="text-amber-600 font-medium">Not yet</span>}
-                        </td>
-                        <td className={`py-2 text-right ${sizeColor(p.documentSizeBytes)}`}>
-                          {p.documentSizeBytes > 0 ? fmtBytes(p.documentSizeBytes) : <span className="text-gray-400">—</span>}
-                        </td>
-                        <td className="py-2 text-right">
-                          {p.anchorCount > 0
-                            ? <span className="text-blue-700 font-semibold">{p.anchorCount}</span>
-                            : <span className="text-gray-400">0</span>}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </Section>
-            )}
-
-            {bing.queryStats.length > 0 ? (
-              <Section title="Bing Search Traffic" sub="Clicks, impressions and position over 90 days">
-                <div className="mb-4">
-                  {(() => {
-                    const maxC = Math.max(...bing.queryStats.map(r => r.clicks), 1)
-                    const maxI = Math.max(...bing.queryStats.map(r => r.impressions), 1)
-                    return (
-                      <>
-                        {/* eslint-disable-next-line react/forbid-dom-props */}
-                        <div className="flex items-end gap-0.5 mb-1" style={{ height: "56px" }}>
-                          {bing.queryStats.map((r, i) => (
-                            <div key={i} className="flex-1 flex flex-col justify-end gap-px"
-                              title={`${r.date}: ${r.clicks} clicks, ${r.impressions} impressions`}>
-                              {/* eslint-disable-next-line react/forbid-dom-props */}
-                              <div className="w-full bg-[#008373]/40 rounded-t-sm" style={{ height: `${(r.impressions / maxI) * 40}%` }} />
-                              {/* eslint-disable-next-line react/forbid-dom-props */}
-                              <div className="w-full bg-[#008373] rounded-t-sm" style={{ height: `${(r.clicks / maxC) * 60}%` }} />
-                            </div>
-                          ))}
-                        </div>
-                        <div className="flex gap-4 text-xs text-gray-600 mb-3">
-                          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[#008373] inline-block" /> Clicks</span>
-                          <span className="flex items-center gap-1"><span className="w-2 h-2 rounded-sm bg-[#008373]/40 inline-block" /> Impressions</span>
-                        </div>
-                      </>
-                    )
-                  })()}
-                </div>
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="text-xs text-gray-600 font-semibold uppercase border-b border-gray-200">
-                      <th className="text-left pb-2">Date</th>
-                      <th className="text-right pb-2">Clicks</th>
-                      <th className="text-right pb-2">Impressions</th>
-                      <th className="text-right pb-2">Avg Position</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {bing.queryStats.map((r, i) => (
-                      <tr key={i} className="border-b border-gray-50 hover:bg-gray-50">
-                        <td className="py-1.5 text-gray-800">{r.date}</td>
-                        <td className="py-1.5 text-right font-semibold text-gray-900">{fmtNum(r.clicks)}</td>
-                        <td className="py-1.5 text-right text-gray-700">{fmtNum(r.impressions)}</td>
-                        <td className="py-1.5 text-right">
-                          <span className={r.avgPosition > 0 && r.avgPosition <= 10 ? "text-green-700 font-semibold" : r.avgPosition > 0 && r.avgPosition <= 20 ? "text-amber-700" : "text-gray-700"}>
-                            {r.avgPosition > 0 ? r.avgPosition.toFixed(1) : "—"}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </Section>
-            ) : (
-              <Section title="Bing Search Traffic" sub="90 days">
-                <div className="text-center py-6 text-gray-500">
-                  <p className="text-sm font-medium text-gray-700 mb-1">No Bing organic search traffic yet</p>
-                  <p className="text-xs text-gray-600">
-                    Bing has low market share in India (&lt;1%). Your pages are being crawled (see above),
-                    but Bing has not sent any organic visits.
-                  </p>
-                </div>
-              </Section>
-            )}
-
-            {(bing.crawlIssues.length > 0 || bing.blockedUrls.length > 0) && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                {bing.crawlIssues.length > 0 && (
-                  <Section title="Crawl Issues">
-                    <pre className="text-xs text-gray-800 overflow-auto max-h-40">
-                      {JSON.stringify(bing.crawlIssues, null, 2)}
-                    </pre>
-                  </Section>
-                )}
-                {bing.blockedUrls.length > 0 && (
-                  <Section title="Blocked URLs">
-                    {bing.blockedUrls.map((u, i) => (
-                      <p key={i} className="text-xs font-mono text-gray-800 py-0.5 border-b border-gray-100 last:border-0">{u}</p>
-                    ))}
-                  </Section>
-                )}
-              </div>
-            )}
+      {bing && bing.pageInfo.length > 0 && (
+        <Card>
+          <CardHeader title="Bing Crawl Status" sub="Per-page crawl info" />
+          <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll">
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-[#222]">
+                  <Th>Page</Th>
+                  <Th right>Discovered</Th>
+                  <Th right>Last Crawled</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {bing.pageInfo.map((p, i) => (
+                  <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                    <Td mono>{p.path}</Td>
+                    <Td right><span className="text-white/50">{p.discoveryDate || "—"}</span></Td>
+                    <Td right>
+                      {p.lastCrawled
+                        ? <span className="text-white/50">{p.lastCrawled}</span>
+                        : <span className="text-amber-400 font-medium">Not yet</span>}
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
-        )
-      })()}
-    </div>
+        </Card>
+      )}
+
+      {bing && bing.queryStats.length > 0 && (
+        <Card>
+          <CardHeader title="Bing Search Traffic" sub="Clicks & impressions · 90 days" />
+          <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "360px" }}>
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-[#222]">
+                  <Th>Date</Th>
+                  <Th right>Clicks</Th>
+                  <Th right>Impressions</Th>
+                  <Th right>Avg Position</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {bing.queryStats.map((r, i) => (
+                  <tr key={i} className="hover:bg-white/[0.02] transition-colors">
+                    <Td><span className="text-white/65">{r.date}</span></Td>
+                    <Td right><span className="font-semibold tabular-nums text-white/85">{fmtNum(r.clicks)}</span></Td>
+                    <Td right><span className="text-white/50 tabular-nums">{fmtNum(r.impressions)}</span></Td>
+                    <Td right>
+                      <span className={r.avgPosition > 0 && r.avgPosition <= 10 ? "text-emerald-400 font-semibold tabular-nums" : "text-white/50 tabular-nums"}>
+                        {r.avgPosition > 0 ? r.avgPosition.toFixed(1) : "—"}
+                      </span>
+                    </Td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Card>
+      )}
+
+      {bing && bing.queryStats.length === 0 && (
+        <Card className="p-5">
+          <p className="text-sm font-medium text-white/55 mb-2">No Bing organic search traffic yet</p>
+          <p className="text-sm text-white/35">Pages are being crawled but Bing has not sent organic visits. Bing has very low market share in India.</p>
+        </Card>
+      )}
+    </section>
   )
 }
 
@@ -1213,33 +780,31 @@ export const dynamic = "force-dynamic"
 
 export default function Home() {
   return (
-    <div className="min-h-screen bg-gray-50">
-      <div className="bg-white border-b border-gray-200 px-8 py-5 sticky top-0 z-10">
-        <div className="max-w-7xl mx-auto">
-          <h1 className="text-xl font-bold text-gray-900">weddingtheory.co.in</h1>
-          <p className="text-sm text-gray-500">Analytics Dashboard</p>
+    <div className="min-h-screen bg-[#0a0a0a]">
+      <header className="sticky top-0 z-40 border-b border-[#1a1a1a]"
+        style={{ background: "rgba(10,10,10,0.85)", backdropFilter: "blur(20px)" }}>
+        <div className="max-w-[1400px] mx-auto px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-7 h-7 rounded-lg bg-white/[0.07] border border-white/[0.1] flex items-center justify-center">
+              <span className="text-xs font-bold text-white/60">W</span>
+            </div>
+            <div>
+              <h1 className="text-sm font-semibold text-white/80 tracking-tight leading-none">weddingtheory.co.in</h1>
+              <p className="text-xs text-white/35 mt-0.5">Analytics Dashboard</p>
+            </div>
+          </div>
+          <DateFilter label="Last 7 / 28 / 90 days" />
         </div>
-      </div>
+      </header>
 
-      <div className="max-w-7xl mx-auto px-8 py-8 space-y-8">
-        <Suspense fallback={<CloudflareSkeleton />}>
-          <CloudflareSection />
-        </Suspense>
-
-        <Suspense fallback={<SearchConsoleSkeleton />}>
-          <SearchConsoleSection />
-        </Suspense>
-
-        <Suspense fallback={<BingSkeleton />}>
-          <BingSection />
-        </Suspense>
-
-        <p className="text-xs text-gray-700 text-center pb-4">
-          * CDN unique visits are estimated per day and not deduplicated across days. Use RUM visits for accurate user counts.
-          Search Console data updates daily. Page indexing is live via URL Inspection API.
-          Bing crawl data is live via Bing Webmaster Tools API.
+      <main className="max-w-[1400px] mx-auto px-6 py-8 space-y-14">
+        <Suspense fallback={<SectionSkeleton />}><CloudflareSection /></Suspense>
+        <Suspense fallback={<SectionSkeleton />}><SearchConsoleSection /></Suspense>
+        <Suspense fallback={<SectionSkeleton />}><BingSection /></Suspense>
+        <p className="text-xs text-white/25 text-center pb-6">
+          Cloudflare: 7-day window · Google Search Console: 28-day window · Bing: 90-day window
         </p>
-      </div>
+      </main>
     </div>
   )
 }

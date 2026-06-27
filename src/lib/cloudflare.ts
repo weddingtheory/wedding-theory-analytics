@@ -115,9 +115,9 @@ export async function getCloudflareData(): Promise<CloudflareData | null> {
   const token  = process.env.Cloudflare_api?.trim()
   if (!zoneId || !token) return null
 
-  const today = fmtDate(new Date())
-  const past  = new Date(); past.setDate(past.getDate() - 7)
-  const past7 = fmtDate(past)
+  const today  = fmtDate(new Date())
+  const past   = new Date(); past.setDate(past.getDate() - 14)
+  const past14 = fmtDate(past)
 
   // ── Step 1: account ID from zone (no Account:Read perm needed) ──────────────
   const zoneResp = await rest(token, `/zones/${zoneId}`)
@@ -131,7 +131,7 @@ export async function getCloudflareData(): Promise<CloudflareData | null> {
         accounts(filter: { accountTag: "${accountId}" }) {
           rumPageloadEventsAdaptiveGroups(
             limit: 1
-            filter: { AND: [{ date_geq: "${past7}" }, { date_leq: "${today}" }] }
+            filter: { AND: [{ date_geq: "${past14}" }, { date_leq: "${today}" }] }
             orderBy: [count_DESC]
           ) { dimensions { siteTag } }
         }
@@ -142,18 +142,18 @@ export async function getCloudflareData(): Promise<CloudflareData | null> {
   }
 
   const errors: unknown[] = []
-  const f7 = `AND: [{ date_geq: "${past7}" }, { date_leq: "${today}" }]`
+  const f14 = `AND: [{ date_geq: "${past14}" }, { date_leq: "${today}" }]`
   const fRum = siteTag
-    ? `AND: [{ date_geq: "${past7}" }, { date_leq: "${today}" }, { siteTag: "${siteTag}" }]`
-    : `AND: [{ date_geq: "${past7}" }, { date_leq: "${today}" }]`
+    ? `AND: [{ date_geq: "${past14}" }, { date_leq: "${today}" }, { siteTag: "${siteTag}" }]`
+    : `AND: [{ date_geq: "${past14}" }, { date_leq: "${today}" }]`
 
-  // ── Query 1: 7-day HTTP analytics ──────────────────────────────────────────
+  // ── Query 1: 14-day HTTP analytics (14 days for % change calc) ─────────────
   const q1 = `{
     viewer {
       zones(filter: { zoneTag: "${zoneId}" }) {
         httpRequests1dGroups(
-          limit: 7
-          filter: { ${f7} }
+          limit: 14
+          filter: { ${f14} }
           orderBy: [date_ASC]
         ) {
           sum {
@@ -197,7 +197,7 @@ export async function getCloudflareData(): Promise<CloudflareData | null> {
     viewer {
       accounts(filter: { accountTag: "${accountId}" }) {
         rumDaily: rumPageloadEventsAdaptiveGroups(
-          limit: 7 filter: { ${fRum} } orderBy: [date_ASC]
+          limit: 14 filter: { ${fRum} } orderBy: [date_ASC]
         ) { count sum { visits } dimensions { date } }
 
         rumCountries: rumPageloadEventsAdaptiveGroups(
