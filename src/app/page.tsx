@@ -3,8 +3,8 @@ import { unstable_cache } from "next/cache"
 import { getCloudflareData } from "@/lib/cloudflare"
 import { getSearchConsoleData, getPageInspections } from "@/lib/search-console"
 import { getBingData } from "@/lib/bing"
-import { User } from "lucide-react"
 import { DateFilter } from "@/components/DateFilter"
+import { UserMenu } from "@/components/UserMenu"
 import { SparklineCard } from "@/components/SparklineCard"
 import { SingleLineChart, SCChart } from "@/components/TrafficChart"
 import { DonutChartsRow, DonutChart } from "@/components/DonutCharts"
@@ -146,7 +146,7 @@ function SectionSkeleton() {
         <Pulse className="h-5 w-48" />
         <div className="flex-1 h-px bg-[#222]" />
       </div>
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         {Array.from({ length: 3 }).map((_, i) => (
           <div key={i} className="bg-[#111] rounded-xl border border-[#222] p-5 space-y-3">
             <Pulse className="h-3 w-24" />
@@ -819,23 +819,18 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ r
     <div className="min-h-screen bg-[#0a0a0a]">
       <header className="sticky top-0 z-40 border-b border-[#1a1a1a]"
         style={{ background: "rgba(10,10,10,0.85)", backdropFilter: "blur(20px)" }}>
-        <div className="max-w-[1400px] mx-auto px-6 py-4 grid grid-cols-3 items-center">
-          <h1 className="text-base font-semibold text-white/80 tracking-tight">Wedding Theory Analytics</h1>
-          <div className="flex justify-center">
+        <div className="max-w-[1400px] mx-auto px-4 sm:px-6 py-3 sm:py-4 grid grid-cols-3 items-center">
+          <h1 className="hidden sm:block text-base font-semibold text-white/80 tracking-tight">Wedding Theory Analytics</h1>
+          <div className="col-span-2 sm:col-span-1 flex justify-start sm:justify-center">
             <DateFilter current={range} />
           </div>
           <div className="flex justify-end">
-            <button
-              className="w-8 h-8 rounded-full bg-white/[0.07] border border-white/[0.1] flex items-center justify-center hover:bg-white/[0.12] transition-colors"
-              aria-label="Account"
-            >
-              <User className="w-4 h-4 text-white/50" />
-            </button>
+            <UserMenu />
           </div>
         </div>
       </header>
 
-      <main className="max-w-[1400px] mx-auto px-6 py-8 space-y-14">
+      <main className="max-w-[1400px] mx-auto px-4 sm:px-6 py-5 sm:py-8 space-y-10 sm:space-y-14">
         <Suspense fallback={<SectionSkeleton />}><CloudflareSection days={days} /></Suspense>
         <Suspense fallback={<SectionSkeleton />}><SearchConsoleSection days={days} /></Suspense>
         <Suspense fallback={<SectionSkeleton />}><BingSection days={days} /></Suspense>
