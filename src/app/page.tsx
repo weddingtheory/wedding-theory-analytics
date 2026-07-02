@@ -92,11 +92,10 @@ function Card({ children, className = "" }: { children: React.ReactNode; classNa
   )
 }
 
-function CardHeader({ title, sub }: { title: string; sub?: string }) {
+function CardHeader({ title }: { title: string }) {
   return (
     <div className="px-5 pt-5 pb-4 border-b border-[#1a1a1a] flex items-baseline gap-2">
       <h3 className="text-xs font-semibold text-white/55 uppercase tracking-[0.1em]">{title}</h3>
-      {sub && <span className="text-xs text-white/30">{sub}</span>}
     </div>
   )
 }
@@ -222,7 +221,6 @@ async function CloudflareSection({ days }: { days: number }) {
   const reqSpark  = currDays.map(d => d.sum.requests)
   const uniqSpark = currDays.map(d => d.uniq.uniques)
   const ppvSpark  = currRumDays.map(d => d.sum.visits > 0 ? d.count / d.sum.visits : 0)
-  const periodLabel = `${days}d`
 
   // Website Performance — exponential-decay score per day (bounded 92-100), see lib/webvitals.ts
   const allVitalsDays  = data.rumVitalsDays
@@ -275,23 +273,19 @@ async function CloudflareSection({ days }: { days: number }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <SparklineCard label="Total Requests" value={fmtNum(H.requests)}
           change={prevDays.length ? changePct(H.requests, Hprev.requests) : undefined}
-          data={reqSpark} color="#818cf8" gradientId="grad-req"
-          periodLabel={periodLabel} />
+          data={reqSpark} color="#818cf8" gradientId="grad-req" />
         <SparklineCard label="Unique Visitors"
           value={fmtNum(H.uniques)}
           change={prevDays.length ? changePct(H.uniques, Hprev.uniques) : undefined}
           data={uniqSpark}
-          color="#34d399" gradientId="grad-vis"
-          periodLabel={periodLabel} />
+          color="#34d399" gradientId="grad-vis" />
         <SparklineCard label="Pages Per Visit"
           value={hasRUM ? currPPV.toFixed(2) : "—"}
           change={hasRUM && prevPPV > 0 ? changePct(currPPV, prevPPV) : undefined}
-          data={hasRUM ? ppvSpark : []} color="#fbbf24" gradientId="grad-ppv"
-          periodLabel={periodLabel} />
+          data={hasRUM ? ppvSpark : []} color="#fbbf24" gradientId="grad-ppv" />
         <SparklineCard label="Website Performance"
           value={hasPerf ? currPerf.toFixed(1) : "—"}
-          data={hasPerf ? perfSpark : []} color="#f472b6" gradientId="grad-perf"
-          periodLabel={periodLabel} />
+          data={hasPerf ? perfSpark : []} color="#f472b6" gradientId="grad-perf" />
       </div>
 
       {/* Data-age note — shown when the site is newer than the selected window */}
@@ -334,7 +328,7 @@ async function CloudflareSection({ days }: { days: number }) {
 
       {/* Daily Breakdown */}
       <Card>
-        <CardHeader title="Daily Breakdown" sub={`${days} days`} />
+        <CardHeader title="Daily Breakdown" />
         <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "460px" }}>
           <table className="w-full">
             <thead>
@@ -368,7 +362,7 @@ async function CloudflareSection({ days }: { days: number }) {
       {/* Top Referrers */}
       {hasRUM && rumReferers.length > 0 && (
         <Card>
-          <CardHeader title="Top Referrers" sub="RUM · visit %" />
+          <CardHeader title="Top Referrers" />
           <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "320px" }}>
             <table className="w-full">
               <thead>
@@ -427,7 +421,6 @@ async function CloudflareSection({ days }: { days: number }) {
 
 async function SearchConsoleSection({ days }: { days: number }) {
   const sc = await cachedSC(days)
-  const periodLabel = `${days}d`
 
   if (!sc) return (
     <section className="space-y-5">
@@ -494,21 +487,17 @@ async function SearchConsoleSection({ days }: { days: number }) {
         <SparklineCard label="Avg Position"
           value={web.avgPosition > 0 ? web.avgPosition.toFixed(1) : "—"}
           change={scHasSufficientData && web.positionPrev > 0 ? -(changePct(web.avgPosition, web.positionPrev)) : web.totalImpressions > 0 ? null : undefined}
-          data={posSpark.map(v => 100 - v)} color="#a78bfa" gradientId="grad-pos"
-          sub={`${days} days · lower = better`} periodLabel={periodLabel} />
+          data={posSpark.map(v => 100 - v)} color="#a78bfa" gradientId="grad-pos" />
         <SparklineCard label="Total Clicks" value={fmtNum(web.totalClicks)}
           change={scHasSufficientData && web.clicksPrev > 0 ? changePct(web.totalClicks, web.clicksPrev) : web.totalClicks > 0 ? null : undefined}
-          data={clickSpark} color="#60a5fa" gradientId="grad-clicks"
-          sub={`${days} days`} periodLabel={periodLabel} />
+          data={clickSpark} color="#60a5fa" gradientId="grad-clicks" />
         <SparklineCard label="Total Impressions" value={fmtNum(web.totalImpressions)}
           change={scHasSufficientData && web.impressionsPrev > 0 ? changePct(web.totalImpressions, web.impressionsPrev) : web.totalImpressions > 0 ? null : undefined}
-          data={imprSpark} color="#34d399" gradientId="grad-impr"
-          sub={`${days} days`} periodLabel={periodLabel} />
+          data={imprSpark} color="#34d399" gradientId="grad-impr" />
         <SparklineCard label="Avg CTR"
           value={web.totalImpressions > 0 ? (web.avgCtr * 100).toFixed(2) + "%" : "—"}
           change={scHasSufficientData && web.ctrPrev > 0 ? changePct(web.avgCtr, web.ctrPrev) : web.totalImpressions > 0 ? null : undefined}
-          data={ctrSpark} color="#fbbf24" gradientId="grad-ctr"
-          sub="click-through rate" periodLabel={periodLabel} />
+          data={ctrSpark} color="#fbbf24" gradientId="grad-ctr" />
       </div>
 
       {/* Data-age note — shown when SC history is shorter than the selected window */}
@@ -522,7 +511,7 @@ async function SearchConsoleSection({ days }: { days: number }) {
       {chartData.length > 0 && (
         <div className="grid grid-cols-1 lg:grid-cols-5 gap-4">
           <Card className="lg:col-span-2">
-            <CardHeader title="Clicks & Impressions" sub={`${days} days`} />
+            <CardHeader title="Clicks & Impressions" />
             <div className="p-5 h-56">
               <SCChart data={chartData} />
             </div>
@@ -532,7 +521,7 @@ async function SearchConsoleSection({ days }: { days: number }) {
           </Card>
 
           <Card className="lg:col-span-3">
-            <CardHeader title="Search Queries" sub={`${days} days`} />
+            <CardHeader title="Search Queries" />
             <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "320px" }}>
               <table className="w-full">
                 <thead>
@@ -568,7 +557,7 @@ async function SearchConsoleSection({ days }: { days: number }) {
 
       {/* Country Map */}
       <Card>
-        <CardHeader title="Clicks by Country" sub={`Google Search · ${days} days`} />
+        <CardHeader title="Clicks by Country" />
         <div className="grid grid-cols-1 lg:grid-cols-5">
           <div className="lg:col-span-3 p-4" style={{ height: "460px" }}>
             <WorldMap countries={scCountryMapData} accentColor="#a78bfa" />
@@ -588,7 +577,7 @@ async function SearchConsoleSection({ days }: { days: number }) {
       {image.totalImpressions > 0 && (
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 items-stretch">
           <Card className="lg:col-span-2">
-            <CardHeader title="Image Search Performance" sub={`${days} days`} />
+            <CardHeader title="Image Search Performance" />
             <div className="p-5 grid grid-cols-3 gap-3 mb-1">
               {[
                 { label: "Avg Position",  value: image.avgPosition > 0 ? image.avgPosition.toFixed(1) : "—" },
@@ -640,7 +629,7 @@ async function SearchConsoleSection({ days }: { days: number }) {
 
       {/* Top Pages */}
       <Card>
-        <CardHeader title="Top Pages" sub={`Web search · ${days} days`} />
+        <CardHeader title="Top Pages" />
         <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "340px" }}>
           <table className="w-full">
             <thead>
@@ -675,7 +664,6 @@ async function SearchConsoleSection({ days }: { days: number }) {
 
 async function BingSection({ days }: { days: number }) {
   const bing = await cachedBing()
-  const periodLabel = `${days}d`
 
   // Bing API always returns 90 days; slice to selected window + prior window for change %
   const cappedDays = Math.min(days, 90)
@@ -722,44 +710,34 @@ async function BingSection({ days }: { days: number }) {
             change={prevClicks > 0 ? clickChange : currClicks > 0 ? null : undefined}
             data={clickSpark}
             color="#34d399"
-            gradientId="bing-clicks"
-            sub={`organic clicks · ${days}d`}
-            periodLabel={periodLabel}
-          />
+            gradientId="bing-clicks" />
           <SparklineCard
             label="Bing Impressions"
             value={fmtNum(currImpr)}
             change={prevImpr > 0 ? imprChange : currImpr > 0 ? null : undefined}
             data={imprSpark}
             color="#818cf8"
-            gradientId="bing-impr"
-            sub={`search impressions · ${days}d`}
-            periodLabel={periodLabel}
-          />
+            gradientId="bing-impr" />
           <SparklineCard
             label="Avg Position"
             value={currPos > 0 ? currPos.toFixed(1) : "—"}
             change={prevPos > 0 ? posChange : currPos > 0 ? null : undefined}
             data={posSpark}
             color="#fbbf24"
-            gradientId="bing-pos"
-            sub="avg rank on Bing"
-            periodLabel={periodLabel}
-          />
+            gradientId="bing-pos" />
           <SparklineCard
             label="Pages Crawled"
             value={`${crawledPages} / ${bing.pageInfo.length}`}
             data={[]}
             color="#60a5fa"
             gradientId="bing-crawl"
-            sub="From sitemap"
           />
         </div>
       )}
 
       {bing && bing.pageInfo.length > 0 && (
         <Card>
-          <CardHeader title="Bing Crawl Status" sub="Per-page crawl info" />
+          <CardHeader title="Bing Crawl Status" />
           <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "460px" }}>
             <table className="w-full">
               <thead>
@@ -789,7 +767,7 @@ async function BingSection({ days }: { days: number }) {
 
       {bing && bing.queryStats.length > 0 && (
         <Card>
-          <CardHeader title="Bing Search Traffic" sub="Clicks & impressions · 90 days" />
+          <CardHeader title="Bing Search Traffic" />
           <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll" style={{ maxHeight: "360px" }}>
             <table className="w-full">
               <thead>

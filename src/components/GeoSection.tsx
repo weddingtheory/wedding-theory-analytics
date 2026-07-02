@@ -3,7 +3,7 @@
 import { useState, useRef, useMemo } from "react"
 import { AreaChart, Area, ResponsiveContainer } from "recharts"
 import { TrendingUp, TrendingDown, Search, X, ChevronRight } from "lucide-react"
-import { computeModelSummary, getDomain } from "@/lib/geo"
+import { getDomain } from "@/lib/geo"
 import type { GeoRunResult, GeoScoreSnapshot, ModelKey, PromptResult } from "@/lib/geo"
 
 const MODEL_META: Record<ModelKey, { label: string; color: string; dim: string; gradientId: string }> = {
@@ -95,16 +95,13 @@ function PosBadge({ pos }: { pos: number | null }) {
 
 // ── Model Card ────────────────────────────────────────────────────────────────
 // Score + sparkline come from score history (across runs in the selected range).
-// avgPosition + mentionCount come from the latest full run.
 
 function ModelCard({
   model,
   scoreHistory,
-  latestRun,
 }: {
   model:        ModelKey
   scoreHistory: GeoScoreSnapshot[]   // runs within the selected date range, oldest first
-  latestRun:    GeoRunResult | null
 }) {
   const m = MODEL_META[model]
 
@@ -120,14 +117,6 @@ function ModelCard({
   // Sparkline = score over time; prepend 0 baseline if only one point so line renders
   const rawSpark  = scoreHistory.map((s, i) => ({ i, v: s.scores[model] }))
   const sparkData = rawSpark.length < 2 ? [{ i: -1, v: 0 }, ...rawSpark] : rawSpark
-
-  // Context from latest full run
-  const summary        = latestRun ? computeModelSummary(model, latestRun) : null
-  const mentionCount   = summary?.mentionCount ?? 0
-  const avgPosition    = summary?.avgPosition ?? null
-  const subText        = mentionCount === 0
-    ? "not ranked in any search"
-    : `${mentionCount}/6 searches · avg #${avgPosition?.toFixed(0)}`
 
   const scoreColor =
     score >= 60 ? "#10b981" :
@@ -151,8 +140,6 @@ function ModelCard({
           {score}
         </p>
         <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30 mt-0.5">GEO Score</p>
-
-        <p className="text-xs text-white/35 mt-2">{subText}</p>
 
         {trend !== null && (
           <div className="flex items-center gap-1.5 mt-2.5">
@@ -215,11 +202,7 @@ function CopilotCard({ crawlPct }: { crawlPct: number | null }) {
         <p className="text-3xl font-bold tabular-nums tracking-tight" style={{ color: scoreColor }}>
           {crawlPct !== null ? `${crawlPct.toFixed(0)}%` : "—"}
         </p>
-        <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30 mt-0.5">Bing Crawl Coverage</p>
-
-        <p className="text-xs text-white/35 mt-2">
-          {crawlPct !== null ? "% of sitemap pages crawled by Bing" : "No Bing crawl data yet"}
-        </p>
+        <p className="text-[10px] font-semibold uppercase tracking-widest text-white/30 mt-0.5">Bing Score</p>
       </div>
     </div>
   )
@@ -449,7 +432,7 @@ export function GeoSection({
       {/* Model cards — score + sparkline from history, context from latest run */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         {MODELS.map(m => (
-          <ModelCard key={m} model={m} scoreHistory={scoreHistory} latestRun={latestRun} />
+          <ModelCard key={m} model={m} scoreHistory={scoreHistory} />
         ))}
         <CopilotCard crawlPct={bingCrawlPct} />
       </div>
@@ -457,7 +440,7 @@ export function GeoSection({
       {/* Prompt vs Position — always latest run */}
       {latestRun && (
         <Card className="w-full">
-          <CardHeader title="Prompt vs Position" sub="6 prompts · 3 models · latest run" />
+          <CardHeader title="Prompt vs Position" />
           <div className="px-5 pt-4 pb-5 overflow-auto thin-scroll">
             <table className="w-full">
               <colgroup>

@@ -11,8 +11,6 @@ interface SparklineCardProps {
   data?: number[]
   color?: string
   gradientId: string
-  sub?: string
-  periodLabel?: string
 }
 
 export function SparklineCard({
@@ -22,8 +20,6 @@ export function SparklineCard({
   data = [],
   color = "#818cf8",
   gradientId,
-  sub,
-  periodLabel = "7d",
 }: SparklineCardProps) {
   const sparkData = data.map((v, i) => ({ i, v }))
   const isNew      = change === null
@@ -54,7 +50,6 @@ export function SparklineCard({
               {isPositive ? "+" : ""}
               {change.toFixed(1)}%
             </span>
-            <span className="text-[11px] text-white/30">vs prev {periodLabel}</span>
           </div>
         )}
         {isNew && (
@@ -64,9 +59,6 @@ export function SparklineCard({
             </span>
             <span className="text-[11px] text-white/30">no prior data</span>
           </div>
-        )}
-        {sub && !hasChange && !isNew && (
-          <p className="text-[11px] text-white/30 mt-1.5">{sub}</p>
         )}
       </div>
 

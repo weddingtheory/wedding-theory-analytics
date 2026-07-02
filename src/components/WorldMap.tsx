@@ -117,7 +117,6 @@ export function WorldMap({ countries, accentColor = "#818cf8" }: { countries: Co
             <p className="font-bold text-lg leading-none mb-1" style={{ background: "linear-gradient(90deg,#818cf8,#c084fc)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>
               {tooltip.pct.toFixed(1)}%
             </p>
-            <p className="text-white/40">{tooltip.visits.toLocaleString()} visits</p>
           </div>
         </div>
       )}
