@@ -1,3 +1,5 @@
+import { unstable_cache } from "next/cache"
+
 const GQL  = "https://api.cloudflare.com/client/v4/graphql"
 const REST = "https://api.cloudflare.com/client/v4"
 
@@ -20,6 +22,48 @@ async function rest(token: string, path: string, revalidate = 3600) {
 }
 
 function fmtDate(d: Date) { return d.toISOString().split("T")[0] }
+
+// ─── Zone → account + siteTag lookup ─────────────────────────────────────────
+// Both are effectively static (a zone's account rarely changes; siteTag is tied
+// to the RUM beacon install), so this is cached independent of `days` and with a
+// long TTL — it used to re-run as two sequential round-trips inside every
+// getCloudflareData() call, including once per prewarmed date range.
+
+async function lookupZoneAccountAndSiteTag(zoneId: string, token: string) {
+  const today    = fmtDate(new Date())
+  const past91   = new Date(); past91.setDate(past91.getDate() - 91)
+  const past91Str = fmtDate(past91)
+
+  const zoneResp = await rest(token, `/zones/${zoneId}`)
+  const accountId: string | undefined = zoneResp?.result?.account?.id
+
+  let siteTag: string | undefined
+  if (accountId) {
+    const disc = await gql(token, `{
+      viewer {
+        accounts(filter: { accountTag: "${accountId}" }) {
+          rumPageloadEventsAdaptiveGroups(
+            limit: 1
+            filter: { AND: [{ date_geq: "${past91Str}" }, { date_leq: "${today}" }] }
+            orderBy: [count_DESC]
+          ) { dimensions { siteTag } }
+        }
+      }
+    }`, 86400)
+    siteTag = disc?.data?.viewer?.accounts?.[0]
+      ?.rumPageloadEventsAdaptiveGroups?.[0]?.dimensions?.siteTag
+  }
+
+  return { accountId, siteTag }
+}
+
+function cachedZoneAccountAndSiteTag(zoneId: string, token: string) {
+  return unstable_cache(
+    () => lookupZoneAccountAndSiteTag(zoneId, token),
+    ["cf-zone-account-sitetag", zoneId],
+    { revalidate: 86400 }
+  )()
+}
 
 // ─── Types — HTTP analytics ───────────────────────────────────────────────────
 
@@ -126,27 +170,8 @@ export async function getCloudflareData(days: number = 7): Promise<CloudflareDat
   const pastRumAllStr = fmtDate(pastRumAll)
   const pastCurrStr   = fmtDate(pastCurr)
 
-  // ── Step 1: account ID from zone ─────────────────────────────────────────
-  const zoneResp = await rest(token, `/zones/${zoneId}`)
-  const accountId: string | undefined = zoneResp?.result?.account?.id
-
-  // ── Step 2: discover siteTag ─────────────────────────────────────────────
-  let siteTag: string | undefined
-  if (accountId) {
-    const disc = await gql(token, `{
-      viewer {
-        accounts(filter: { accountTag: "${accountId}" }) {
-          rumPageloadEventsAdaptiveGroups(
-            limit: 1
-            filter: { AND: [{ date_geq: "${pastRumAllStr}" }, { date_leq: "${today}" }] }
-            orderBy: [count_DESC]
-          ) { dimensions { siteTag } }
-        }
-      }
-    }`, 3600)
-    siteTag = disc?.data?.viewer?.accounts?.[0]
-      ?.rumPageloadEventsAdaptiveGroups?.[0]?.dimensions?.siteTag
-  }
+  // ── Step 1: account ID + siteTag (cached separately, see above) ─────────
+  const { accountId, siteTag } = await cachedZoneAccountAndSiteTag(zoneId, token)
 
   const errors: unknown[] = []
 

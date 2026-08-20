@@ -815,14 +815,6 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ r
   const { range = "7d" } = await searchParams
   const days = range === "90d" ? 90 : range === "30d" ? 30 : range === "15d" ? 15 : 7
 
-  // Pre-warm the other three range caches so switching feels instant.
-  // These are fire-and-forget: if already cached they resolve immediately; if cold
-  // they populate in the background before the user clicks a different range.
-  ;([7, 15, 30, 90] as const).filter(d => d !== days).forEach(d => {
-    cachedCloudflare(d).catch(() => {})
-    cachedSC(d).catch(() => {})
-  })
-
   return (
     <div className="min-h-screen bg-[#0a0a0a]">
       <header className="sticky top-0 z-40 border-b border-[#1a1a1a]"
